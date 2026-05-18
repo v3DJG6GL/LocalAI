@@ -15,11 +15,12 @@ import (
 	"github.com/mudler/LocalAI/core/templates"
 	"github.com/mudler/LocalAI/pkg/model"
 
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // EditEndpoint is the OpenAI edit API endpoint
 // @Summary OpenAI edit endpoint
+// @Tags inference
 // @Param request body schema.OpenAIRequest true "query params"
 // @Success 200 {object} schema.OpenAIResponse "Response"
 // @Router /v1/edits [post]
@@ -39,8 +40,8 @@ func EditEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 			return echo.ErrBadRequest
 		}
 
-		log.Debug().Msgf("Edit Endpoint Input : %+v", input)
-		log.Debug().Msgf("Edit Endpoint Config: %+v", *config)
+		xlog.Debug("Edit Endpoint Input", "input", input)
+		xlog.Debug("Edit Endpoint Config", "config", *config)
 
 		var result []schema.Choice
 		totalTokenUsage := backend.TokenUsage{}
@@ -55,10 +56,10 @@ func EditEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 			})
 			if err == nil {
 				i = templatedInput
-				log.Debug().Msgf("Template found, input modified to: %s", i)
+				xlog.Debug("Template found, input modified", "input", i)
 			}
 
-			r, tokenUsage, err := ComputeChoices(input, i, config, cl, appConfig, ml, func(s string, c *[]schema.Choice) {
+			r, tokenUsage, _, err := ComputeChoices(input, i, config, cl, appConfig, ml, func(s string, c *[]schema.Choice) {
 				*c = append(*c, schema.Choice{Text: s})
 			}, nil)
 			if err != nil {
@@ -91,11 +92,11 @@ func EditEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 			Model:   input.Model, // we have to return what the user sent here, due to OpenAI spec.
 			Choices: result,
 			Object:  "edit",
-			Usage:   usage,
+			Usage:   &usage,
 		}
 
 		jsonResult, _ := json.Marshal(resp)
-		log.Debug().Msgf("Response: %s", jsonResult)
+		xlog.Debug("Response", "response", string(jsonResult))
 
 		// Return the prediction in the response body
 		return c.JSON(200, resp)

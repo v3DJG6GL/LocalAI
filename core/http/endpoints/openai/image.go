@@ -23,10 +23,15 @@ import (
 	"github.com/mudler/LocalAI/core/backend"
 
 	model "github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/LocalAI/pkg/utils"
+	"github.com/mudler/xlog"
 )
 
 func downloadFile(url string) (string, error) {
+	if err := utils.ValidateExternalURL(url); err != nil {
+		return "", fmt.Errorf("URL validation failed: %w", err)
+	}
+
 	// Get the data
 	resp, err := http.Get(url)
 	if err != nil {
@@ -63,6 +68,7 @@ func downloadFile(url string) (string, error) {
 */
 // ImageEndpoint is the OpenAI Image generation API endpoint https://platform.openai.com/docs/api-reference/images/create
 // @Summary Creates an image given a prompt.
+// @Tags images
 // @Param request body schema.OpenAIRequest true "query params"
 // @Success 200 {object} schema.OpenAIResponse "Response"
 // @Router /v1/images/generations [post]
@@ -70,13 +76,13 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 	return func(c echo.Context) error {
 		input, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.OpenAIRequest)
 		if !ok || input.Model == "" {
-			log.Error().Msg("Image Endpoint - Invalid Input")
+			xlog.Error("Image Endpoint - Invalid Input")
 			return echo.ErrBadRequest
 		}
 
 		config, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.ModelConfig)
 		if !ok || config == nil {
-			log.Error().Msg("Image Endpoint - Invalid Config")
+			xlog.Error("Image Endpoint - Invalid Config")
 			return echo.ErrBadRequest
 		}
 
@@ -113,7 +119,7 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 			}
 		}
 
-		log.Debug().Msgf("Parameter Config: %+v", config)
+		xlog.Debug("Parameter Config", "config", config)
 
 		switch config.Backend {
 		case "stablediffusion":
@@ -124,7 +130,7 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 
 		if !strings.Contains(input.Size, "x") {
 			input.Size = "512x512"
-			log.Warn().Msgf("Invalid size, using default 512x512")
+			xlog.Warn("Invalid size, using default 512x512")
 		}
 
 		sizeParts := strings.Split(input.Size, "x")
@@ -149,7 +155,7 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 			if input.N == 0 {
 				n = 1
 			}
-			for j := 0; j < n; j++ {
+			for range n {
 				prompts := strings.Split(i, "|")
 				positive_prompt := prompts[0]
 				negative_prompt := ""
@@ -157,14 +163,9 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 					negative_prompt = prompts[1]
 				}
 
-				mode := 0
 				step := config.Step
 				if step == 0 {
 					step = 15
-				}
-
-				if input.Mode != 0 {
-					mode = input.Mode
 				}
 
 				if input.Step != 0 {
@@ -197,7 +198,7 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 					inputSrc = inputImages[0]
 				}
 
-				fn, err := backend.ImageGeneration(height, width, mode, step, *config.Seed, positive_prompt, negative_prompt, inputSrc, output, ml, *config, appConfig, refImages)
+				fn, err := backend.ImageGeneration(height, width, step, *config.Seed, positive_prompt, negative_prompt, inputSrc, output, ml, *config, appConfig, refImages)
 				if err != nil {
 					return err
 				}
@@ -232,10 +233,21 @@ func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfi
 			ID:      id,
 			Created: created,
 			Data:    result,
+			Usage: &schema.OpenAIUsage{
+				PromptTokens:     0,
+				CompletionTokens: 0,
+				TotalTokens:      0,
+				InputTokens:      0,
+				OutputTokens:     0,
+				InputTokensDetails: &schema.InputTokensDetails{
+					TextTokens:  0,
+					ImageTokens: 0,
+				},
+			},
 		}
 
 		jsonResult, _ := json.Marshal(resp)
-		log.Debug().Msgf("Response: %s", jsonResult)
+		xlog.Debug("Response", "response", string(jsonResult))
 
 		// Return the prediction in the response body
 		return c.JSON(200, resp)
@@ -251,21 +263,21 @@ func processImageFile(file string, generatedContentDir string) string {
 	if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
 		out, err := downloadFile(file)
 		if err != nil {
-			log.Error().Err(err).Msgf("Failed downloading file: %s", file)
+			xlog.Error("Failed downloading file", "error", err, "file", file)
 			return ""
 		}
 		defer os.RemoveAll(out)
 
 		fileData, err = os.ReadFile(out)
 		if err != nil {
-			log.Error().Err(err).Msgf("Failed reading downloaded file: %s", out)
+			xlog.Error("Failed reading downloaded file", "error", err, "file", out)
 			return ""
 		}
 	} else {
 		// base 64 decode the file and write it somewhere that we will cleanup
 		fileData, err = base64.StdEncoding.DecodeString(file)
 		if err != nil {
-			log.Error().Err(err).Msgf("Failed decoding base64 file")
+			xlog.Error("Failed decoding base64 file", "error", err)
 			return ""
 		}
 	}
@@ -273,16 +285,21 @@ func processImageFile(file string, generatedContentDir string) string {
 	// Create a temporary file
 	outputFile, err := os.CreateTemp(generatedContentDir, "b64")
 	if err != nil {
-		log.Error().Err(err).Msg("Failed creating temporary file")
+		xlog.Error("Failed creating temporary file", "error", err)
 		return ""
 	}
 
-	// write the base64 result
+	// write the decoded result
 	writer := bufio.NewWriter(outputFile)
 	_, err = writer.Write(fileData)
 	if err != nil {
 		outputFile.Close()
-		log.Error().Err(err).Msg("Failed writing to temporary file")
+		xlog.Error("Failed writing to temporary file", "error", err)
+		return ""
+	}
+	if err := writer.Flush(); err != nil {
+		outputFile.Close()
+		xlog.Error("Failed flushing to temporary file", "error", err)
 		return ""
 	}
 	outputFile.Close()

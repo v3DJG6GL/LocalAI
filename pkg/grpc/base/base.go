@@ -3,6 +3,7 @@ package base
 // This is a wrapper to satisfy the GRPC service interface
 // It is meant to be used by the main executable that is the server for the specific backend type (falcon, gpt3, etc)
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -57,11 +58,19 @@ func (llm *Base) GenerateVideo(*pb.GenerateVideoRequest) error {
 	return fmt.Errorf("unimplemented")
 }
 
-func (llm *Base) AudioTranscription(*pb.TranscriptRequest) (pb.TranscriptResult, error) {
+func (llm *Base) AudioTranscription(context.Context, *pb.TranscriptRequest) (pb.TranscriptResult, error) {
 	return pb.TranscriptResult{}, fmt.Errorf("unimplemented")
 }
 
+func (llm *Base) AudioTranscriptionStream(context.Context, *pb.TranscriptRequest, chan *pb.TranscriptStreamResponse) error {
+	return fmt.Errorf("unimplemented")
+}
+
 func (llm *Base) TTS(*pb.TTSRequest) error {
+	return fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) TTSStream(*pb.TTSRequest, chan []byte) error {
 	return fmt.Errorf("unimplemented")
 }
 
@@ -73,8 +82,36 @@ func (llm *Base) Detect(*pb.DetectOptions) (pb.DetectResponse, error) {
 	return pb.DetectResponse{}, fmt.Errorf("unimplemented")
 }
 
+func (llm *Base) FaceVerify(*pb.FaceVerifyRequest) (pb.FaceVerifyResponse, error) {
+	return pb.FaceVerifyResponse{}, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) FaceAnalyze(*pb.FaceAnalyzeRequest) (pb.FaceAnalyzeResponse, error) {
+	return pb.FaceAnalyzeResponse{}, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) VoiceVerify(*pb.VoiceVerifyRequest) (pb.VoiceVerifyResponse, error) {
+	return pb.VoiceVerifyResponse{}, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) VoiceAnalyze(*pb.VoiceAnalyzeRequest) (pb.VoiceAnalyzeResponse, error) {
+	return pb.VoiceAnalyzeResponse{}, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) VoiceEmbed(*pb.VoiceEmbedRequest) (pb.VoiceEmbedResponse, error) {
+	return pb.VoiceEmbedResponse{}, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) Diarize(*pb.DiarizeRequest) (pb.DiarizeResponse, error) {
+	return pb.DiarizeResponse{}, fmt.Errorf("unimplemented")
+}
+
 func (llm *Base) TokenizeString(opts *pb.PredictOptions) (pb.TokenizationResponse, error) {
 	return pb.TokenizationResponse{}, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) ModelMetadata(opts *pb.ModelOptions) (*pb.ModelMetadataResponse, error) {
+	return nil, fmt.Errorf("unimplemented")
 }
 
 // backends may wish to call this to capture the gopsutil info, then enhance with additional memory usage details?
@@ -104,6 +141,60 @@ func (llm *Base) VAD(*pb.VADRequest) (pb.VADResponse, error) {
 	return pb.VADResponse{}, fmt.Errorf("unimplemented")
 }
 
+func (llm *Base) AudioEncode(*pb.AudioEncodeRequest) (*pb.AudioEncodeResult, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) AudioDecode(*pb.AudioDecodeRequest) (*pb.AudioDecodeResult, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) AudioTransform(*pb.AudioTransformRequest) (*pb.AudioTransformResult, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) AudioTransformStream(in <-chan *pb.AudioTransformFrameRequest, out chan<- *pb.AudioTransformFrameResponse) error {
+	close(out)
+	return fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) AudioToAudioStream(in <-chan *pb.AudioToAudioRequest, out chan<- *pb.AudioToAudioResponse) error {
+	close(out)
+	return fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) StartFineTune(*pb.FineTuneRequest) (*pb.FineTuneJobResult, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) FineTuneProgress(*pb.FineTuneProgressRequest, chan *pb.FineTuneProgressUpdate) error {
+	return fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) StopFineTune(*pb.FineTuneStopRequest) error {
+	return fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) ListCheckpoints(*pb.ListCheckpointsRequest) (*pb.ListCheckpointsResponse, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) ExportModel(*pb.ExportModelRequest) error {
+	return fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) StartQuantization(*pb.QuantizationRequest) (*pb.QuantizationJobResult, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) QuantizationProgress(*pb.QuantizationProgressRequest, chan *pb.QuantizationProgressUpdate) error {
+	return fmt.Errorf("unimplemented")
+}
+
+func (llm *Base) StopQuantization(*pb.QuantizationStopRequest) error {
+	return fmt.Errorf("unimplemented")
+}
+
 func memoryUsage() *pb.MemoryUsageData {
 	mud := pb.MemoryUsageData{
 		Breakdown: make(map[string]uint64),
@@ -121,4 +212,7 @@ func memoryUsage() *pb.MemoryUsageData {
 		}
 	}
 	return &mud
+}
+func (llm *Base) Free() error {
+	return nil
 }

@@ -12,8 +12,8 @@ import (
 	"github.com/mudler/LocalAI/core/p2p"
 	"github.com/mudler/LocalAI/pkg/signals"
 	"github.com/mudler/LocalAI/pkg/system"
+	"github.com/mudler/xlog"
 	"github.com/phayes/freeport"
-	"github.com/rs/zerolog/log"
 )
 
 type P2P struct {
@@ -38,7 +38,7 @@ func (r *P2P) Run(ctx *cliContext.Context) error {
 	// Check if the token is set
 	// as we always need it.
 	if r.Token == "" {
-		return fmt.Errorf("Token is required")
+		return fmt.Errorf("a P2P token is required to join the network. Set it via the LOCALAI_TOKEN environment variable or the --token flag. You can generate a token by running 'local-ai run --p2p' on the main node. See https://localai.io/features/distribute/ for more information")
 	}
 
 	port, err := freeport.GetFreePort()
@@ -62,20 +62,20 @@ func (r *P2P) Run(ctx *cliContext.Context) error {
 			p = r.RunnerPort
 		}
 
-		_, err = p2p.ExposeService(c, address, p, r.Token, p2p.NetworkID(r.Peer2PeerNetworkID, p2p.WorkerID))
+		_, err = p2p.ExposeService(c, address, p, r.Token, p2p.NetworkID(r.Peer2PeerNetworkID, p2p.LlamaCPPWorkerID))
 		if err != nil {
 			return err
 		}
-		log.Info().Msgf("You need to start llama-cpp-rpc-server on '%s:%s'", address, p)
+		xlog.Info("You need to start llama-cpp-rpc-server", "address", address, "port", p)
 	} else {
 		// Start llama.cpp directly from the version we have pre-packaged
 		go func() {
 			for {
-				log.Info().Msgf("Starting llama-cpp-rpc-server on '%s:%d'", address, port)
+				xlog.Info("Starting llama-cpp-rpc-server", "address", address, "port", port)
 
-				grpcProcess, err := findLLamaCPPBackend(r.BackendGalleries, systemState)
+				grpcProcess, err := findLLamaCPPBackend(r.BackendGalleries, systemState, r.RequireBackendIntegrity)
 				if err != nil {
-					log.Error().Err(err).Msg("Failed to find llama-cpp-rpc-server")
+					xlog.Error("Failed to find llama-cpp-rpc-server", "error", err)
 					return
 				}
 
@@ -85,7 +85,7 @@ func (r *P2P) Run(ctx *cliContext.Context) error {
 					extraArgs = strings.Split(r.ExtraLLamaCPPArgs, " ")
 				}
 				args := append([]string{"--host", address, "--port", fmt.Sprint(port)}, extraArgs...)
-				log.Debug().Msgf("Starting llama-cpp-rpc-server on '%s:%d' with args: %+v (%d)", address, port, args, len(args))
+				xlog.Debug("Starting llama-cpp-rpc-server", "address", address, "port", port, "args", args, "argCount", len(args))
 
 				cmd := exec.Command(
 					grpcProcess, args...,
@@ -97,14 +97,14 @@ func (r *P2P) Run(ctx *cliContext.Context) error {
 				cmd.Stdout = os.Stdout
 
 				if err := cmd.Start(); err != nil {
-					log.Error().Any("grpcProcess", grpcProcess).Any("args", args).Err(err).Msg("Failed to start llama-cpp-rpc-server")
+					xlog.Error("Failed to start llama-cpp-rpc-server", "error", err, "grpcProcess", grpcProcess, "args", args)
 				}
 
 				cmd.Wait()
 			}
 		}()
 
-		_, err = p2p.ExposeService(c, address, fmt.Sprint(port), r.Token, p2p.NetworkID(r.Peer2PeerNetworkID, p2p.WorkerID))
+		_, err = p2p.ExposeService(c, address, fmt.Sprint(port), r.Token, p2p.NetworkID(r.Peer2PeerNetworkID, p2p.LlamaCPPWorkerID))
 		if err != nil {
 			return err
 		}

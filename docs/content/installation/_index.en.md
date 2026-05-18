@@ -8,34 +8,36 @@ icon: download
 
 LocalAI can be installed in multiple ways depending on your platform and preferences.
 
-{{% notice tip %}}
-**Recommended: Docker Installation**
+## Video Walkthrough
 
-**Docker is the recommended installation method** for most users as it works across all platforms (Linux, macOS, Windows) and provides the easiest setup experience. It's the fastest way to get started with LocalAI.
-{{% /notice %}}
+[![Installation Video](https://img.youtube.com/vi/cMVNnlqwfw4/maxresdefault.jpg)](https://www.youtube.com/watch?v=cMVNnlqwfw4)
 
 ## Installation Methods
 
 Choose the installation method that best suits your needs:
 
-1. **[Docker](docker/)** ⭐ **Recommended** - Works on all platforms, easiest setup
+1. **[Containers](containers/)** ⭐ **Recommended** - Works on all platforms, supports Docker and Podman
 2. **[macOS](macos/)** - Download and install the DMG application
-3. **[Linux](linux/)** - Install on Linux using the one-liner script or binaries
+3. **[Linux](linux/)** - Install on Linux using binaries
 4. **[Kubernetes](kubernetes/)** - Deploy LocalAI on Kubernetes clusters
 5. **[Build from Source](build/)** - Build LocalAI from source code
 
 ## Quick Start
 
-**Recommended: Docker (works on all platforms)**
+**Recommended: Containers (Docker or Podman)**
 
 ```bash
+# With Docker
 docker run -p 8080:8080 --name local-ai -ti localai/localai:latest
+
+# Or with Podman
+podman run -p 8080:8080 --name local-ai -ti localai/localai:latest
 ```
 
-This will start LocalAI. The API will be available at `http://localhost:8080`. For images with pre-configured models, see [All-in-One images](/getting-started/container-images/#all-in-one-images).
+This will start LocalAI. The API will be available at `http://localhost:8080`.
 
 For other platforms:
 - **macOS**: Download the [DMG](macos/)
-- **Linux**: Use the `curl https://localai.io/install.sh | sh` [one-liner](linux/)
+- **Linux**: See the [Linux installation guide](linux/) for binary installation.
 
-For detailed instructions, see the [Docker installation guide](docker/).
+For detailed instructions, see the [Containers installation guide](containers/).

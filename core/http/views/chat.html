@@ -41,13 +41,23 @@ SOFTWARE.
     __chatContextSize = {{ .ContextSize }};
     {{ end }}
 
-    // Store gallery configs for header icon display
+    // Store gallery configs for header icon display and model info modal
     window.__galleryConfigs = {};
     {{ $allGalleryConfigs:=.GalleryConfig }}
     {{ range $modelName, $galleryConfig := $allGalleryConfigs }}
     window.__galleryConfigs["{{$modelName}}"] = {};
     {{ if $galleryConfig.Icon }}
     window.__galleryConfigs["{{$modelName}}"].Icon = "{{$galleryConfig.Icon}}";
+    {{ end }}
+    {{ if $galleryConfig.Description }}
+    window.__galleryConfigs["{{$modelName}}"].Description = {{ printf "%q" $galleryConfig.Description }};
+    {{ end }}
+    {{ if $galleryConfig.URLs }}
+    window.__galleryConfigs["{{$modelName}}"].URLs = [
+      {{ range $idx, $url := $galleryConfig.URLs }}
+      {{ if $idx }},{{ end }}{{ printf "%q" $url }}
+      {{ end }}
+    ];
     {{ end }}
     {{ end }}
 
@@ -276,11 +286,30 @@ SOFTWARE.
           }
         },
         
-        add(role, content, image, audio, targetChatId = null) {
+        add(role, content, image, audio, targetChatId = null, model = null) {
           // If targetChatId is provided, add to that chat, otherwise use active chat
           // This allows streaming to continue to the correct chat even if user switches
           const chat = targetChatId ? this.getChat(targetChatId) : this.activeChat();
           if (!chat) return;
+          
+          // Determine model for this message:
+          // - If model is explicitly provided, use it (for assistant messages with specific model)
+          // - For user messages, use the current chat's model
+          // - For other messages (thinking, tool_call, etc.), inherit from previous message or use chat model
+          let messageModel = model;
+          if (!messageModel) {
+            if (role === "user") {
+              // User messages always use the current chat's model
+              messageModel = chat.model || "";
+            } else if (role === "assistant") {
+              // Assistant messages use the chat's model (should be set when request is made)
+              messageModel = chat.model || "";
+            } else {
+              // For thinking, tool_call, etc., try to inherit from last assistant message, or use chat model
+              const lastAssistant = chat.history.slice().reverse().find(m => m.role === "assistant");
+              messageModel = lastAssistant?.model || chat.model || "";
+            }
+          }
           
           const N = chat.history.length - 1;
           // For thinking, reasoning, tool_call, and tool_result messages, always create a new message
@@ -307,11 +336,11 @@ SOFTWARE.
                 c += DOMPurify.sanitize(marked.parse(line));
               });
             }
-            // Set expanded state: thinking is expanded by default in non-MCP mode, collapsed in MCP mode
-            // Reasoning, tool_call, and tool_result are always collapsed by default
+            // Set expanded state: thinking and reasoning are expanded by default in non-MCP mode, collapsed in MCP mode
+            // tool_call and tool_result are always collapsed by default
             const isMCPMode = chat.mcpMode || false;
-            const shouldExpand = (role === "thinking" && !isMCPMode) || false;
-            chat.history.push({ role, content, html: c, image, audio, expanded: shouldExpand });
+            const shouldExpand = ((role === "thinking" || role === "reasoning") && !isMCPMode) || false;
+            chat.history.push({ role, content, html: c, image, audio, expanded: shouldExpand, model: messageModel });
             
             // Auto-name chat from first user message
             if (role === "user" && chat.name === "New Chat" && content.trim()) {
@@ -332,6 +361,10 @@ SOFTWARE.
             if (audio && audio.length > 0) {
               chat.history[N].audio = [...(chat.history[N].audio || []), ...audio];
             }
+            // Preserve model if merging (don't overwrite)
+            if (!chat.history[N].model && messageModel) {
+              chat.history[N].model = messageModel;
+            }
           } else {
             let c = "";
             const lines = content.split("\n");
@@ -343,7 +376,8 @@ SOFTWARE.
               content, 
               html: c, 
               image: image || [], 
-              audio: audio || [] 
+              audio: audio || [],
+              model: messageModel
             });
             
             // Auto-name chat from first user message
@@ -473,6 +507,11 @@ SOFTWARE.
       activeChat.model = modelName;
       activeChat.updatedAt = Date.now();
       
+      // Update model info modal with new model
+      if (window.updateModelInfoModal) {
+        window.updateModelInfoModal(modelName);
+      }
+      
       // Get context size from data attribute
       let contextSize = null;
       if (selectedOption.dataset.contextSize) {
@@ -512,18 +551,23 @@ SOFTWARE.
       }
       
       // Update model selector to reflect the change (ensure it stays in sync)
+      // Note: We don't dispatch a change event here to avoid infinite loop
+      // The selector is already updated via user interaction or programmatic change
       const modelSelector = document.getElementById('modelSelector');
       if (modelSelector) {
         // Find and select the option matching the model
         const optionValue = 'chat/' + modelName;
         for (let i = 0; i < modelSelector.options.length; i++) {
           if (modelSelector.options[i].value === optionValue) {
-            modelSelector.selectedIndex = i;
+            // Only update if it's different to avoid unnecessary updates
+            if (modelSelector.selectedIndex !== i) {
+              modelSelector.selectedIndex = i;
+            }
             break;
           }
         }
-        // Trigger Alpine reactivity by dispatching change event
-        modelSelector.dispatchEvent(new Event('change', { bubbles: true }));
+        // Don't dispatch change event here - it would cause infinite recursion
+        // The selector is already in sync with the model
       }
       
       // Trigger MCP availability check in Alpine component
@@ -543,19 +587,25 @@ SOFTWARE.
   <script defer src="static/chat.js"></script>
   {{ $allGalleryConfigs:=.GalleryConfig }}
   {{ $model:=.Model}}
-  <body class="bg-[var(--color-bg-primary)] text-[var(--color-text-primary)] flex flex-col h-screen" x-data="{ sidebarOpen: true, showClearAlert: false }">
-    {{template "views/partials/navbar" .}}
+  <body class="bg-[var(--color-bg-primary)] text-[var(--color-text-primary)]" x-data="{ settingsPanelOpen: true, showClearAlert: false, isMobile: false }" x-init="isMobile = window.innerWidth < 1024; if (isMobile) settingsPanelOpen = false; window.addEventListener('resize', () => { isMobile = window.innerWidth < 1024 })">
+    <div class="app-layout chat-layout">
+      {{template "views/partials/navbar" .}}
+      
+      <main class="main-content chat-layout">
+        <div class="main-content-inner chat-layout h-full flex flex-col">
 
-    <!-- Main container with sidebar toggle -->
-    <div class="flex flex-1 overflow-hidden relative">
-      <!-- Sidebar -->
+    <!-- Main container with settings panel -->
+    <div class="flex flex-1 min-h-0 relative">
+      <!-- Backdrop for mobile when settings panel is open (click to close) -->
+      <div x-show="settingsPanelOpen && isMobile" x-transition:enter="transition ease-out duration-200" x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100" x-transition:leave="transition ease-in duration-150" x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0" @click="settingsPanelOpen = false" class="fixed inset-0 bg-black/50 z-20" aria-hidden="true"></div>
+      <!-- Chat Settings Panel (right side): overlay on mobile (w-full), sidebar on desktop (md:w-56) -->
       <div
-        class="sidebar bg-[var(--color-bg-secondary)] fixed top-14 bottom-0 left-0 w-56 transform transition-transform duration-300 ease-in-out z-30 border-r border-[var(--color-bg-primary)] overflow-y-auto"
-        :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'">
+        class="chat-settings-panel bg-[var(--color-bg-secondary)] fixed top-0 right-0 bottom-0 w-full md:w-56 transform transition-transform duration-300 ease-in-out z-30 border-l border-[var(--color-border-subtle)] overflow-y-auto"
+        :class="settingsPanelOpen ? 'translate-x-0' : 'translate-x-full'">
 
-        <div class="p-3 flex justify-between items-center border-b border-[var(--color-bg-primary)]">
+        <div class="p-3 flex justify-between items-center border-b border-[var(--color-border-subtle)]">
           <div class="flex items-center gap-2">
-            <h2 class="text-sm font-semibold text-[var(--color-text-primary)]">Settings</h2>
+            <h2 class="text-sm font-semibold text-[var(--color-text-primary)]">Chat Settings</h2>
             <a
               href="https://localai.io/features/text-generation/"
               target="_blank"
@@ -565,10 +615,10 @@ SOFTWARE.
             </a>
           </div>
           <button
-            @click="sidebarOpen = false"
+            @click="settingsPanelOpen = false"
             class="text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] focus:outline-none text-xs"
-            title="Hide sidebar">
-            <i class="fa-solid fa-chevron-left"></i>
+            title="Hide settings">
+            <i class="fa-solid fa-chevron-right"></i>
           </button>
         </div>
 
@@ -579,27 +629,52 @@ SOFTWARE.
             <div class="flex items-center justify-between gap-2">
               <label class="text-xs font-medium text-[var(--color-text-secondary)] uppercase tracking-wide flex-shrink-0">Model</label>
               <div class="flex items-center gap-1 flex-shrink-0">
-                {{ if $model }}
-                {{ $galleryConfig:= index $allGalleryConfigs $model}}
-                {{ if $galleryConfig }}
-                <button 
-                  data-twe-ripple-init 
-                  data-twe-ripple-color="light" 
-                  class="text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors text-xs p-1 rounded hover:bg-[var(--color-bg-primary)]" 
-                  data-modal-target="model-info-modal" 
-                  data-modal-toggle="model-info-modal"
-                  title="Model Information">
-                  <i class="fas fa-info-circle"></i>
-                </button>
-                {{ end }}
-                {{ end }}
-                {{ if $model }}
-                <a href="/models/edit/{{$model}}" 
-                   class="text-[var(--color-text-secondary)] hover:text-[var(--color-warning)] transition-colors text-xs p-1 rounded hover:bg-[var(--color-bg-primary)]" 
-                   title="Edit Model Configuration">
-                  <i class="fas fa-edit"></i>
-                </a>
-                {{ end }}
+                <!-- Info button - reactive to active chat model -->
+                <template x-if="$store.chat.activeChat() && $store.chat.activeChat().model && window.__galleryConfigs && window.__galleryConfigs[$store.chat.activeChat().model]">
+                  <button 
+                    data-twe-ripple-init 
+                    data-twe-ripple-color="light" 
+                    class="text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors text-xs p-1 rounded hover:bg-[var(--color-bg-primary)]" 
+                    data-modal-target="model-info-modal" 
+                    data-modal-toggle="model-info-modal"
+                    :data-model-name="$store.chat.activeChat().model"
+                    @click="if (window.updateModelInfoModal) { window.updateModelInfoModal($store.chat.activeChat().model, true); }"
+                    title="Model Information">
+                    <i class="fas fa-info-circle"></i>
+                  </button>
+                </template>
+                <!-- Fallback info button for initial model from server -->
+                <template x-if="(!$store.chat.activeChat() || !$store.chat.activeChat().model) && window.__galleryConfigs && window.__galleryConfigs['{{$model}}']">
+                  <button 
+                    data-twe-ripple-init 
+                    data-twe-ripple-color="light" 
+                    class="text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors text-xs p-1 rounded hover:bg-[var(--color-bg-primary)]" 
+                    data-modal-target="model-info-modal" 
+                    data-modal-toggle="model-info-modal"
+                    data-model-name="{{$model}}"
+                    @click="if (window.updateModelInfoModal) { window.updateModelInfoModal('{{$model}}', true); }"
+                    title="Model Information">
+                    <i class="fas fa-info-circle"></i>
+                  </button>
+                </template>
+                <!-- Edit button - reactive to active chat model -->
+                <template x-if="$store.chat.activeChat() && $store.chat.activeChat().model">
+                  <a :href="'/models/edit/' + $store.chat.activeChat().model" 
+                     class="text-[var(--color-text-secondary)] hover:text-[var(--color-warning)] transition-colors text-xs p-1 rounded hover:bg-[var(--color-bg-primary)]" 
+                     title="Edit Model Configuration">
+                    <i class="fas fa-edit"></i>
+                  </a>
+                </template>
+                <!-- Fallback edit button for initial model from server -->
+                <template x-if="!$store.chat.activeChat() || !$store.chat.activeChat().model">
+                  {{ if $model }}
+                  <a href="/models/edit/{{$model}}" 
+                     class="text-[var(--color-text-secondary)] hover:text-[var(--color-warning)] transition-colors text-xs p-1 rounded hover:bg-[var(--color-bg-primary)]" 
+                     title="Edit Model Configuration">
+                    <i class="fas fa-edit"></i>
+                  </a>
+                  {{ end }}
+                </template>
               </div>
             </div>
             <select
@@ -820,7 +895,7 @@ SOFTWARE.
 
           <div x-data="{ showPromptForm: false, showParamsForm: false }" class="space-y-2">
               <!-- MCP Toggle - Compact (shown dynamically based on model support) -->
-              <div x-data="{ 
+              <div x-data="{
                 mcpAvailable: false,
                 checkMCP() {
                   const modelSelector = document.getElementById('modelSelector');
@@ -835,7 +910,7 @@ SOFTWARE.
                   }
                   const hasMCP = selectedOption.getAttribute('data-has-mcp') === 'true';
                   this.mcpAvailable = hasMCP;
-                  
+
                   // If model doesn't support MCP, disable MCP mode
                   const activeChat = $store.chat.activeChat();
                   if (activeChat && !hasMCP) {
@@ -1030,61 +1105,57 @@ SOFTWARE.
         </div>
       </div>
 
-      <!-- Main chat container (shifts with sidebar) -->
+      <!-- Main chat container (shifts with settings panel on desktop only; on mobile panel overlays) -->
       <div
-        class="flex-1 flex flex-col transition-all duration-300 ease-in-out"
-        :class="sidebarOpen ? 'ml-56' : 'ml-0'">
+        class="flex-1 flex flex-col min-h-0 transition-all duration-300 ease-in-out"
+        :class="settingsPanelOpen ? 'md:mr-56' : 'mr-0'">
 
         <!-- Chat header with toggle button -->
-        <div class="border-b border-[var(--color-bg-secondary)] p-4 flex items-center justify-between">
-          <div class="flex items-center">
-            <!-- Sidebar toggle button moved to be the first element in the header and with clear styling -->
-            <button
-              @click="sidebarOpen = !sidebarOpen"
-              class="mr-4 text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] focus:outline-none bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-secondary)]/80 p-2 rounded transition-colors"
-              style="min-width: 36px;"
-              title="Toggle settings">
-              <i class="fa-solid" :class="sidebarOpen ? 'fa-chevron-left' : 'fa-bars'"></i>
-            </button>
-
-            <div class="flex items-center">
-              <i class="fa-solid fa-comments mr-2 text-[var(--color-primary)]"></i>
-              <!-- Model icon - reactive to active chat -->
-              <template x-if="$store.chat.activeChat() && $store.chat.activeChat().model && window.__galleryConfigs && window.__galleryConfigs[$store.chat.activeChat().model] && window.__galleryConfigs[$store.chat.activeChat().model].Icon">
-                <img :src="window.__galleryConfigs[$store.chat.activeChat().model].Icon" class="rounded-lg w-8 h-8 mr-2">
+        <div class="flex-shrink-0 border-b border-[var(--color-bg-secondary)] p-4 flex flex-wrap items-center justify-between gap-2">
+          <div class="flex items-center min-w-0 flex-1">
+            <i class="fa-solid fa-comments mr-2 text-[var(--color-primary)] flex-shrink-0"></i>
+            <!-- Model icon - reactive to active chat -->
+            <template x-if="$store.chat.activeChat() && $store.chat.activeChat().model && window.__galleryConfigs && window.__galleryConfigs[$store.chat.activeChat().model] && window.__galleryConfigs[$store.chat.activeChat().model].Icon">
+              <img :src="window.__galleryConfigs[$store.chat.activeChat().model].Icon" class="rounded-lg w-8 h-8 mr-2 flex-shrink-0">
+            </template>
+            <!-- Fallback icon for initial model from server (when no active chat yet) -->
+            <template x-if="(!$store.chat.activeChat() || !$store.chat.activeChat().model) && window.__galleryConfigs && window.__galleryConfigs['{{$model}}'] && window.__galleryConfigs['{{$model}}'].Icon">
+              <img :src="window.__galleryConfigs['{{$model}}'].Icon" class="rounded-lg w-8 h-8 mr-2 flex-shrink-0">
+            </template>
+            <h1 class="text-lg font-semibold text-[var(--color-text-primary)] truncate min-w-0">
+              Chat
+              <template x-if="$store.chat.activeChat() && $store.chat.activeChat().model">
+                <span x-text="' with ' + $store.chat.activeChat().model"></span>
               </template>
-              <!-- Fallback icon for initial model from server (when no active chat yet) -->
-              <template x-if="(!$store.chat.activeChat() || !$store.chat.activeChat().model) && window.__galleryConfigs && window.__galleryConfigs['{{$model}}'] && window.__galleryConfigs['{{$model}}'].Icon">
-                <img :src="window.__galleryConfigs['{{$model}}'].Icon" class="rounded-lg w-8 h-8 mr-2">
+              <template x-if="!$store.chat.activeChat() || !$store.chat.activeChat().model">
+                {{ if .Model }}<span> with {{.Model}}</span>{{ end }}
               </template>
-              <h1 class="text-lg font-semibold text-[var(--color-text-primary)]">
-                Chat
-                <template x-if="$store.chat.activeChat() && $store.chat.activeChat().model">
-                  <span x-text="' with ' + $store.chat.activeChat().model"></span>
-                </template>
-                <template x-if="!$store.chat.activeChat() || !$store.chat.activeChat().model">
-                  {{ if .Model }}<span> with {{.Model}}</span>{{ end }}
-                </template>
-              </h1>
-              <!-- Loading indicator next to model name -->
-              <div id="header-loading-indicator" class="ml-3 text-[var(--color-primary)]" style="display: none;">
-                <i class="fas fa-spinner fa-spin text-sm"></i>
-              </div>
+            </h1>
+            <!-- Loading indicator next to model name -->
+            <div id="header-loading-indicator" class="ml-3 text-[var(--color-primary)] flex-shrink-0" style="display: none;">
+              <i class="fas fa-spinner fa-spin text-sm"></i>
             </div>
           </div>
 
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-2 flex-shrink-0">
             <button
               @click="if (confirm('Clear all messages from this conversation? This action cannot be undone.')) { $store.chat.clear(); showClearAlert = true; setTimeout(() => showClearAlert = false, 3000); }"
               id="clear"
               title="Clear current chat history"
-              class="text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors p-2 rounded hover:bg-[var(--color-bg-secondary)]"
+              class="text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors p-2 min-w-[44px] min-h-[44px] md:min-w-0 md:min-h-0 flex items-center justify-center rounded hover:bg-[var(--color-bg-secondary)]"
               x-show="$store.chat.activeChat() && ($store.chat.activeChat()?.history?.length || 0) > 0">
               <i class="fa-solid fa-broom"></i>
             </button>
+            <!-- Settings panel toggle button -->
+            <button
+              @click="settingsPanelOpen = !settingsPanelOpen"
+              class="text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] focus:outline-none bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-secondary)]/80 p-2 min-w-[44px] min-h-[44px] md:min-w-0 md:min-h-0 flex items-center justify-center rounded transition-colors"
+              title="Toggle chat settings">
+              <i class="fa-solid" :class="settingsPanelOpen ? 'fa-chevron-right' : 'fa-cog'"></i>
+            </button>
           </div>
           
-          <!-- Clear Chat Alert -->
+          <!-- Clear Chat Alert (bottom on mobile to avoid covering header) -->
           <div x-show="showClearAlert"
                x-transition:enter="transition ease-out duration-300"
                x-transition:enter-start="opacity-0 translate-y-2"
@@ -1092,7 +1163,7 @@ SOFTWARE.
                x-transition:leave="transition ease-in duration-200"
                x-transition:leave-start="opacity-100"
                x-transition:leave-end="opacity-0"
-               class="fixed top-20 right-4 z-50 max-w-sm pointer-events-none">
+               class="fixed top-20 right-4 max-md:top-auto max-md:bottom-4 max-md:left-4 max-md:right-4 z-50 max-w-sm pointer-events-none">
             <div class="bg-[var(--color-primary)]/20 border border-[var(--color-primary-border)]/40 rounded-lg p-3 shadow-lg backdrop-blur-sm">
               <div class="flex items-center gap-2">
                 <i class="fa-solid fa-check-circle text-[var(--color-primary)]"></i>
@@ -1103,7 +1174,8 @@ SOFTWARE.
         </div>
 
         <!-- Chat messages area -->
-        <div class="flex-1 p-4 overflow-auto" id="chat">
+        <div class="flex-1 min-h-0 overflow-y-auto" id="chat">
+          <div class="p-4">
           <p id="usage" x-show="!$store.chat.activeChat() || ($store.chat.activeChat()?.history?.length || 0) === 0" class="text-[var(--color-text-secondary)]">
             Start chatting with the AI by typing a prompt in the input field below and pressing Enter.<br>
             <ul class="list-disc list-inside mt-2 space-y-1">
@@ -1248,11 +1320,20 @@ SOFTWARE.
                 </template>
                 <template x-if="message.role != 'user' && message.role != 'thinking' && message.role != 'reasoning' && message.role != 'tool_call' && message.role != 'tool_result'">
                   <div class="flex items-center space-x-2">
-                    {{ if $galleryConfig }}
-                    {{ if $galleryConfig.Icon }}<img src="{{$galleryConfig.Icon}}" class="rounded-lg mt-2 max-w-8 max-h-8 border border-[var(--color-primary-border)]/20">{{end}}
-                    {{ end }}
+                    <!-- Model icon - from message history, fallback to active chat -->
+                    <template x-if="message.model && window.__galleryConfigs && window.__galleryConfigs[message.model] && window.__galleryConfigs[message.model].Icon">
+                      <img :src="window.__galleryConfigs[message.model].Icon" class="rounded-lg mt-2 max-w-8 max-h-8 border border-[var(--color-primary-border)]/20">
+                    </template>
+                    <!-- Fallback: use active chat model if message doesn't have one -->
+                    <template x-if="!message.model && $store.chat.activeChat() && $store.chat.activeChat().model && window.__galleryConfigs && window.__galleryConfigs[$store.chat.activeChat().model] && window.__galleryConfigs[$store.chat.activeChat().model].Icon">
+                      <img :src="window.__galleryConfigs[$store.chat.activeChat().model].Icon" class="rounded-lg mt-2 max-w-8 max-h-8 border border-[var(--color-primary-border)]/20">
+                    </template>
+                    <!-- Final fallback: initial model from server -->
+                    <template x-if="!message.model && (!$store.chat.activeChat() || !$store.chat.activeChat().model) && window.__galleryConfigs && window.__galleryConfigs['{{$model}}'] && window.__galleryConfigs['{{$model}}'].Icon">
+                      <img :src="window.__galleryConfigs['{{$model}}'].Icon" class="rounded-lg mt-2 max-w-8 max-h-8 border border-[var(--color-primary-border)]/20">
+                    </template>
                     <div class="flex flex-col flex-1">
-                      <span class="text-xs font-semibold text-[var(--color-text-secondary)] mb-1">{{if .Model}}{{.Model}}{{else}}Assistant{{end}}</span>
+                      <span class="text-xs font-semibold text-[var(--color-text-secondary)] mb-1" x-text="message.model || $store.chat.activeChat()?.model || '{{if .Model}}{{.Model}}{{else}}Assistant{{end}}'"></span>
                       <div class="flex-1 text-[var(--color-text-primary)] flex items-center space-x-2 min-w-0">
                         <div class="p-3 rounded-lg bg-[var(--color-bg-secondary)] border border-[var(--color-accent-border)]/20 shadow-lg max-w-full overflow-x-auto overflow-wrap-anywhere" x-html="message.html"></div>
                         <button @click="copyToClipboard(message.html)" title="Copy to clipboard" class="text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors p-1 flex-shrink-0">
@@ -1289,11 +1370,11 @@ SOFTWARE.
               </div>
             </template>
           </div>
+          </div>
         </div>
 
-
           <!-- Chat Input -->
-          <div class="p-4 border-t border-[var(--color-bg-secondary)]" x-data="{ inputValue: '', shiftPressed: false, attachedFiles: [] }">
+          <div class="flex-shrink-0 p-4 pb-safe border-t border-[var(--color-bg-secondary)] bg-[var(--color-bg-primary)]" x-data="{ inputValue: '', shiftPressed: false, attachedFiles: [] }">
             <form id="prompt" action="chat/{{.Model}}" method="get" @submit.prevent="submitPrompt" class="max-w-3xl mx-auto">
               <!-- Attachment Tags - Show above input when files are attached -->
               <div x-show="attachedFiles.length > 0" class="mb-3 flex flex-wrap gap-2 items-center">
@@ -1313,38 +1394,38 @@ SOFTWARE.
                 </template>
               </div>
 
-              <!-- Token Usage and Context Window - Compact above input -->
-              <div class="mb-3 flex items-center justify-between gap-4 text-xs">
-                <!-- Token Usage -->
-                <div class="flex items-center gap-3 text-[var(--color-text-secondary)]">
-                  <div class="flex items-center gap-1">
+              <!-- Token Usage and Context Window - responsive: two rows on mobile -->
+              <div class="mb-3 flex flex-col md:flex-row md:items-center md:justify-between gap-3 text-xs">
+                <!-- Token Usage (wraps on mobile) -->
+                <div class="flex flex-wrap items-center gap-2 md:gap-3 text-[var(--color-text-secondary)]">
+                  <div class="flex items-center gap-1 max-md:hidden">
                     <i class="fas fa-chart-line text-[var(--color-primary)]"></i>
                     <span>Prompt:</span>
                     <span class="text-[var(--color-text-primary)] font-medium" x-text="new Intl.NumberFormat().format($store.chat.activeChat()?.tokenUsage?.promptTokens || 0)"></span>
                   </div>
-                  <div class="flex items-center gap-1">
+                  <div class="flex items-center gap-1 max-md:hidden">
                     <span>Completion:</span>
                     <span class="text-[var(--color-text-primary)] font-medium" x-text="new Intl.NumberFormat().format($store.chat.activeChat()?.tokenUsage?.completionTokens || 0)"></span>
                   </div>
-                  <div class="flex items-center gap-1 border-l border-[var(--color-bg-secondary)] pl-3">
+                  <div class="flex items-center gap-1 md:border-l border-[var(--color-bg-secondary)] pl-0 md:pl-3">
                     <span class="text-[var(--color-primary)] font-semibold">Total:</span>
                     <span class="text-[var(--color-text-primary)] font-bold" x-text="new Intl.NumberFormat().format($store.chat.activeChat()?.tokenUsage?.totalTokens || 0)"></span>
                   </div>
                   <!-- Tokens per second display -->
-                  <div id="tokens-per-second-container" class="flex items-center gap-1 border-l border-[var(--color-bg-secondary)] pl-3">
+                  <div id="tokens-per-second-container" class="flex items-center gap-1 border-l border-[var(--color-bg-secondary)] pl-2 md:pl-3">
                     <i class="fas fa-tachometer-alt text-[var(--color-primary)]"></i>
                     <span id="tokens-per-second" class="text-[var(--color-text-primary)] font-medium">-</span>
                     <span id="max-tokens-per-second-badge" class="ml-2 px-1.5 py-0.5 text-[10px] bg-[var(--color-primary)]/20 text-[var(--color-primary)] rounded border border-[var(--color-primary-border)]/30 hidden"></span>
                   </div>
                 </div>
 
-                <!-- Context Window -->
+                <!-- Context Window (second row on mobile) -->
                 <template x-if="$store.chat.activeChat()?.contextSize && $store.chat.activeChat().contextSize > 0">
-                  <div class="flex items-center gap-2 text-[var(--color-text-secondary)]">
+                  <div class="flex items-center gap-2 text-[var(--color-text-secondary)] flex-shrink-0">
                     <i class="fas fa-database text-[var(--color-primary)]"></i>
                     <span>
                       <span class="text-[var(--color-text-primary)] font-medium" x-text="new Intl.NumberFormat().format($store.chat.activeChat()?.tokenUsage?.totalTokens || 0)"></span>
-                      / 
+                      /
                       <span class="text-[var(--color-text-primary)] font-medium" x-text="new Intl.NumberFormat().format($store.chat.activeChat()?.contextSize || 0)"></span>
                     </span>
                     <div class="w-16 bg-[var(--color-bg-primary)] rounded-full h-1.5 overflow-hidden border border-[var(--color-bg-secondary)]">
@@ -1365,38 +1446,36 @@ SOFTWARE.
                 </template>
               </div>
 
+              <!-- Attachment buttons row (mobile only) - avoids overlap with input on narrow screens -->
+              <div class="flex flex-wrap gap-2 mb-2 md:hidden">
+                <button type="button" onclick="document.getElementById('input_image').click()" class="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg bg-[var(--color-bg-secondary)] text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors border border-[var(--color-border-subtle)]" title="Attach images" aria-label="Attach images">
+                  <i class="fa-solid fa-image text-lg"></i>
+                </button>
+                <button type="button" onclick="document.getElementById('input_audio').click()" class="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg bg-[var(--color-bg-secondary)] text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors border border-[var(--color-border-subtle)]" title="Attach an audio file" aria-label="Attach audio">
+                  <i class="fa-solid fa-microphone text-lg"></i>
+                </button>
+                <button type="button" onclick="document.getElementById('input_file').click()" class="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg bg-[var(--color-bg-secondary)] text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors border border-[var(--color-border-subtle)]" title="Upload text, markdown or PDF file" aria-label="Attach file">
+                  <i class="fa-solid fa-file text-lg"></i>
+                </button>
+              </div>
+
               <div class="relative w-full">
                 <textarea
                   id="input"
                   name="input"
                   x-model="inputValue"
-                  class="input w-full p-3 pr-16 resize-none border-0"
+                  class="input w-full p-3 pr-12 md:pr-28 resize-none border-0 bg-[var(--color-bg-secondary)] text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none rounded-xl transition-colors duration-200"
                   placeholder="Send a message..."
-                  class="p-3 pr-16 w-full bg-[var(--color-bg-secondary)] text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] focus:outline-none resize-none border-0 rounded-xl transition-colors duration-200"
                   required
                   @keydown.shift="shiftPressed = true"
                   @keyup.shift="shiftPressed = false"
                   @keydown.enter.prevent="if (!shiftPressed) { submitPrompt($event); }"
                   rows="2"
                 ></textarea>
-                <button
-                  type="button"
-                  onclick="document.getElementById('input_image').click()"
-                  class="fa-solid fa-image text-[var(--color-text-secondary)] absolute right-12 top-3 text-base p-1.5 hover:text-[var(--color-primary)] transition-colors duration-200"
-                  title="Attach images"
-                ></button>
-                <button
-                  type="button"
-                  onclick="document.getElementById('input_audio').click()"
-                  class="fa-solid fa-microphone text-[var(--color-text-secondary)] absolute right-20 top-3 text-base p-1.5 hover:text-[var(--color-primary)] transition-colors duration-200"
-                  title="Attach an audio file"
-                ></button>
-                <button
-                  type="button"
-                  onclick="document.getElementById('input_file').click()"
-                  class="fa-solid fa-file text-[var(--color-text-secondary)] absolute right-28 top-3 text-base p-1.5 hover:text-[var(--color-primary)] transition-colors duration-200"
-                  title="Upload text, markdown or PDF file"
-                ></button>
+                <!-- Attachment buttons (desktop only - inside input) -->
+                <button type="button" onclick="document.getElementById('input_image').click()" class="hidden md:flex fa-solid fa-image text-[var(--color-text-secondary)] absolute right-12 top-3 text-base p-1.5 hover:text-[var(--color-primary)] transition-colors duration-200 items-center justify-center" title="Attach images" aria-label="Attach images"></button>
+                <button type="button" onclick="document.getElementById('input_audio').click()" class="hidden md:flex fa-solid fa-microphone text-[var(--color-text-secondary)] absolute right-20 top-3 text-base p-1.5 hover:text-[var(--color-primary)] transition-colors duration-200 items-center justify-center" title="Attach an audio file" aria-label="Attach audio"></button>
+                <button type="button" onclick="document.getElementById('input_file').click()" class="hidden md:flex fa-solid fa-file text-[var(--color-text-secondary)] absolute right-28 top-3 text-base p-1.5 hover:text-[var(--color-primary)] transition-colors duration-200 items-center justify-center" title="Upload text, markdown or PDF file" aria-label="Attach file"></button>
 
                 <!-- Send button and stop button in the same position -->
                 <div class="absolute right-3 top-3 flex items-center">
@@ -1405,7 +1484,7 @@ SOFTWARE.
                     id="stop-button"
                     type="button"
                     onclick="stopRequest()"
-                    class="text-lg p-2 text-[var(--color-error)] hover:text-[var(--color-error)] transition-colors duration-200"
+                    class="text-lg p-2 min-w-[44px] min-h-[44px] md:min-w-0 md:min-h-0 flex items-center justify-center text-[var(--color-error)] hover:text-[var(--color-error)] transition-colors duration-200"
                     style="display: none;"
                     title="Stop request"
                   >
@@ -1416,7 +1495,7 @@ SOFTWARE.
                   <button
                     id="send-button"
                     type="submit"
-                    class="text-lg p-2 text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors duration-200"
+                    class="text-lg p-2 min-w-[44px] min-h-[44px] md:min-w-0 md:min-h-0 flex items-center justify-center text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors duration-200"
                     title="Send message (Enter)"
                   >
                     <i class="fa-solid fa-paper-plane"></i>
@@ -1455,17 +1534,14 @@ SOFTWARE.
       </div>
     </div>
 
-    <!-- Modal moved outside of sidebar to appear in center of page -->
-    {{ if $model }}
-    {{ $galleryConfig:= index $allGalleryConfigs $model}}
-    {{ if $galleryConfig }}
-    <div id="model-info-modal" tabindex="-1" aria-hidden="true" class="hidden overflow-y-auto overflow-x-hidden fixed top-0 right-0 left-0 z-50 flex justify-center items-center w-full md:inset-0 h-[calc(100%-1rem)] max-h-full">
+    <!-- Modal moved outside of sidebar to appear in center of page - Always available, content updated dynamically -->
+    <div id="model-info-modal" tabindex="-1" aria-hidden="true" class="hidden overflow-y-auto overflow-x-hidden fixed top-0 right-0 left-0 z-50 flex justify-center items-center w-full h-full md:inset-0 max-h-full" style="padding: 1rem;">
       <div class="relative p-4 w-full max-w-2xl max-h-full">
-        <div class="relative p-4 w-full max-w-2xl max-h-full bg-white rounded-lg shadow dark:bg-gray-700">
+        <div class="relative p-4 w-full max-w-2xl max-h-full bg-[var(--color-bg-secondary)] rounded-lg shadow border border-[var(--color-border-subtle)]">
           <!-- Header -->
-          <div class="flex items-center justify-between p-4 md:p-5 border-b rounded-t dark:border-gray-600">
-            <h3 class="text-xl font-semibold text-gray-900 dark:text-white">{{ $model }}</h3>
-            <button class="text-gray-400 bg-transparent hover:bg-gray-200 hover:text-gray-900 rounded-lg text-sm w-8 h-8 ms-auto inline-flex justify-center items-center dark:hover:bg-gray-600 dark:hover:text-white" data-modal-hide="model-info-modal">
+          <div class="flex items-center justify-between p-4 md:p-5 border-b border-[var(--color-border-subtle)] rounded-t">
+            <h3 id="model-info-modal-title" class="text-xl font-semibold text-[var(--color-text-primary)]">{{ if $model }}{{ $model }}{{ end }}</h3>
+            <button class="text-[var(--color-text-secondary)] bg-transparent hover:bg-[var(--color-bg-primary)] hover:text-[var(--color-text-primary)] rounded-lg text-sm w-8 h-8 ms-auto inline-flex justify-center items-center transition-colors" data-modal-hide="model-info-modal" @click="if (window.closeModelInfoModal) { window.closeModelInfoModal(); }">
               <svg class="w-3 h-3" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 14 14">
                 <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m1 1 6 6m0 0 6 6M7 7l6-6M7 7l-6 6"/>
               </svg>
@@ -1476,29 +1552,24 @@ SOFTWARE.
           <!-- Body -->
           <div class="p-4 md:p-5 space-y-4">
             <div class="flex justify-center items-center">
-              {{ if $galleryConfig.Icon }}<img class="lazy rounded-t-lg max-h-48 max-w-96 object-cover mt-3 entered loaded" src="{{$galleryConfig.Icon}}" loading="lazy"/>{{end}}
+              <img id="model-info-modal-icon" class="lazy rounded-t-lg max-h-48 max-w-96 object-cover mt-3 entered loaded" style="display: none;" loading="lazy"/>
             </div>
-            <div id="model-info-description" class="text-base leading-relaxed text-gray-500 dark:text-gray-400 break-words max-w-full">{{ $galleryConfig.Description }}</div>
-            <hr>
-            <p class="text-sm font-semibold text-gray-900 dark:text-white">Links</p>
-            <ul>
-              {{range $galleryConfig.URLs}}
-              <li><a href="{{ . }}" target="_blank">{{ . }}</a></li>
-              {{end}}
+            <div id="model-info-description" class="text-base leading-relaxed text-[var(--color-text-secondary)] break-words max-w-full"></div>
+            <hr class="border-[var(--color-border-subtle)]">
+            <p class="text-sm font-semibold text-[var(--color-text-primary)]">Links</p>
+            <ul id="model-info-links">
             </ul>
           </div>
 
           <!-- Footer -->
-          <div class="flex items-center p-4 md:p-5 border-t border-gray-200 rounded-b dark:border-gray-600">
-            <button data-modal-hide="model-info-modal" class="py-2.5 px-5 ms-3 text-sm font-medium text-gray-900 focus:outline-none bg-white rounded-lg border border-gray-200 hover:bg-gray-100 hover:text-blue-700 focus:z-10 focus:ring-4 focus:ring-gray-100 dark:focus:ring-gray-700 dark:bg-gray-800 dark:text-gray-400 dark:border-gray-600 dark:hover:text-white dark:hover:bg-gray-700">
+          <div class="flex items-center p-4 md:p-5 border-t border-[var(--color-border-subtle)] rounded-b">
+            <button data-modal-hide="model-info-modal" class="py-2.5 px-5 ms-3 text-sm font-medium text-white focus:outline-none bg-[var(--color-primary)] rounded-lg border-none hover:bg-[var(--color-primary-hover)] focus:z-10 focus:ring-2 focus:ring-[var(--color-primary)]/50 transition-colors" @click="if (window.closeModelInfoModal) { window.closeModelInfoModal(); }">
               Close
             </button>
           </div>
         </div>
       </div>
     </div>
-    {{ end }}
-    {{ end }}
 
     <!-- Alpine store initialization and utilities -->
     <script>
@@ -1709,10 +1780,20 @@ SOFTWARE.
         });
 
         // Also listen for click events on modal toggle buttons
-        document.querySelectorAll('[data-modal-toggle="model-info-modal"]').forEach(button => {
-          button.addEventListener('click', () => {
+        // Use event delegation to handle dynamically created buttons
+        document.addEventListener('click', (e) => {
+          const button = e.target.closest('[data-modal-toggle="model-info-modal"]');
+          if (button) {
+            // Update modal with current model before showing
+            if (window.Alpine && window.Alpine.store("chat")) {
+              const activeChat = window.Alpine.store("chat").activeChat();
+              const modelName = activeChat ? activeChat.model : (button.dataset.modelName || (document.getElementById("chat-model") ? document.getElementById("chat-model").value : null));
+              if (modelName && window.updateModelInfoModal) {
+                window.updateModelInfoModal(modelName, true);
+              }
+            }
             setTimeout(processMarkdown, 300);
-          });
+          }
         });
 
         // Process on initial load if libraries are ready
@@ -1753,12 +1834,176 @@ SOFTWARE.
         syncModelSelectorOnLoad();
       }
 
+      // Function to update model info modal with current model
+      // Set openModal to true to actually open the modal, false to just update content
+      window.updateModelInfoModal = function(modelName, openModal = false) {
+        if (!modelName) {
+          return;
+        }
+        if (!window.__galleryConfigs) {
+          return;
+        }
+        
+        const galleryConfig = window.__galleryConfigs[modelName];
+        // Check if galleryConfig exists and has at least one property
+        if (!galleryConfig || Object.keys(galleryConfig).length === 0) {
+          // Still update the modal title even if no config, so user can see which model they clicked
+          const titleEl = document.getElementById('model-info-modal-title');
+          if (titleEl) {
+            titleEl.textContent = modelName;
+          }
+          // Show message that no info is available
+          const descEl = document.getElementById('model-info-description');
+          if (descEl) {
+            descEl.textContent = 'No additional information available for this model.';
+          }
+          const linksEl = document.getElementById('model-info-links');
+          if (linksEl) {
+            linksEl.innerHTML = '';
+          }
+          const iconEl = document.getElementById('model-info-modal-icon');
+          if (iconEl) {
+            iconEl.style.display = 'none';
+          }
+          // Only open the modal if explicitly requested
+          if (openModal) {
+            const modalElement = document.getElementById('model-info-modal');
+            if (modalElement) {
+              modalElement.classList.remove('hidden');
+              modalElement.setAttribute('aria-hidden', 'false');
+              // Add backdrop
+              let backdrop = document.querySelector('.modal-backdrop');
+              if (!backdrop) {
+                backdrop = document.createElement('div');
+                backdrop.className = 'modal-backdrop fixed inset-0 bg-black/50 z-40';
+                document.body.appendChild(backdrop);
+                backdrop.addEventListener('click', () => {
+                  closeModelInfoModal();
+                });
+              }
+            }
+          }
+          return;
+        }
+        
+        // Update modal title
+        const titleEl = document.getElementById('model-info-modal-title');
+        if (titleEl) {
+          titleEl.textContent = modelName;
+        }
+        
+        // Update icon
+        const iconEl = document.getElementById('model-info-modal-icon');
+        if (iconEl) {
+          if (galleryConfig.Icon) {
+            iconEl.src = galleryConfig.Icon;
+            iconEl.style.display = 'block';
+          } else {
+            iconEl.style.display = 'none';
+          }
+        }
+        
+        // Update description
+        const descEl = document.getElementById('model-info-description');
+        if (descEl) {
+          descEl.textContent = galleryConfig.Description || 'No description available.';
+        }
+        
+        // Update links
+        const linksEl = document.getElementById('model-info-links');
+        if (linksEl && galleryConfig.URLs && Array.isArray(galleryConfig.URLs) && galleryConfig.URLs.length > 0) {
+          linksEl.innerHTML = '';
+          galleryConfig.URLs.forEach(url => {
+            const li = document.createElement('li');
+            const a = document.createElement('a');
+            a.href = url;
+            a.target = '_blank';
+            a.textContent = url;
+            li.appendChild(a);
+            linksEl.appendChild(li);
+          });
+        } else if (linksEl) {
+          linksEl.innerHTML = '<li>No links available</li>';
+        }
+        
+        // Only open the modal if explicitly requested
+        if (openModal) {
+          const modalElement = document.getElementById('model-info-modal');
+          if (modalElement) {
+            // Ensure positioning classes are present (they might have been removed)
+            if (!modalElement.classList.contains('flex')) {
+              modalElement.classList.add('flex');
+            }
+            if (!modalElement.classList.contains('justify-center')) {
+              modalElement.classList.add('justify-center');
+            }
+            if (!modalElement.classList.contains('items-center')) {
+              modalElement.classList.add('items-center');
+            }
+            // Ensure fixed positioning
+            if (!modalElement.classList.contains('fixed')) {
+              modalElement.classList.add('fixed');
+            }
+            // Ensure full width and height
+            if (!modalElement.classList.contains('w-full')) {
+              modalElement.classList.add('w-full');
+            }
+            if (!modalElement.classList.contains('h-full')) {
+              modalElement.classList.add('h-full');
+            }
+            // Ensure padding is set
+            if (!modalElement.style.padding) {
+              modalElement.style.padding = '1rem';
+            }
+            // Remove hidden class if present
+            modalElement.classList.remove('hidden');
+            // Set aria-hidden to false
+            modalElement.setAttribute('aria-hidden', 'false');
+            // Add backdrop if needed
+            let backdrop = document.querySelector('.modal-backdrop');
+            if (!backdrop) {
+              backdrop = document.createElement('div');
+              backdrop.className = 'modal-backdrop fixed inset-0 bg-black/50 z-40';
+              document.body.appendChild(backdrop);
+              backdrop.addEventListener('click', () => {
+                window.closeModelInfoModal();
+              });
+            }
+          }
+        }
+      };
+      
+      // Function to close the model info modal
+      window.closeModelInfoModal = function() {
+        const modalElement = document.getElementById('model-info-modal');
+        if (modalElement) {
+          modalElement.classList.add('hidden');
+          modalElement.setAttribute('aria-hidden', 'true');
+        }
+        const backdrop = document.querySelector('.modal-backdrop');
+        if (backdrop) {
+          backdrop.remove();
+        }
+      };
+
       // Also sync after Alpine initializes (in case it runs after DOMContentLoaded)
+      function initializeModelInfo() {
+        syncModelSelectorOnLoad();
+        // Initialize model info modal content with current model (but don't open it)
+        if (window.updateModelInfoModal && window.Alpine && window.Alpine.store("chat")) {
+          const activeChat = window.Alpine.store("chat").activeChat();
+          const modelName = activeChat ? activeChat.model : (document.getElementById("chat-model") ? document.getElementById("chat-model").value : null);
+          if (modelName) {
+            window.updateModelInfoModal(modelName, false); // false = don't open, just update content
+          }
+        }
+      }
+      
       if (window.Alpine) {
-        Alpine.nextTick(syncModelSelectorOnLoad);
+        Alpine.nextTick(initializeModelInfo);
       } else {
         document.addEventListener('alpine:init', () => {
-          Alpine.nextTick(syncModelSelectorOnLoad);
+          Alpine.nextTick(initializeModelInfo);
         });
       }
     </script>
@@ -1821,8 +2066,8 @@ SOFTWARE.
         word-wrap: break-word;
         overflow-wrap: break-word;
         white-space: pre;
-        background: #101827 !important;
-        border: 1px solid #1E293B;
+        background: var(--color-bg-primary) !important;
+        border: 1px solid var(--color-border-subtle);
         border-radius: 6px;
         padding: 12px;
         margin: 0;
@@ -1835,7 +2080,7 @@ SOFTWARE.
         overflow-wrap: break-word;
         white-space: pre;
         background: transparent !important;
-        color: #E5E7EB;
+        color: var(--color-text-primary);
         font-family: 'ui-monospace', 'Monaco', 'Consolas', monospace;
         font-size: 0.875rem;
         line-height: 1.5;
@@ -1938,13 +2183,13 @@ SOFTWARE.
         height: 6px;
       }
 
-      .sidebar::-webkit-scrollbar-track,
+      .chat-settings-panel::-webkit-scrollbar-track,
       #chat::-webkit-scrollbar-track,
       #messages::-webkit-scrollbar-track {
         background: transparent;
       }
 
-      .sidebar::-webkit-scrollbar-thumb,
+      .chat-settings-panel::-webkit-scrollbar-thumb,
       #chat::-webkit-scrollbar-thumb,
       #messages::-webkit-scrollbar-thumb {
         background: rgba(148, 163, 184, 0.2);
@@ -1952,14 +2197,14 @@ SOFTWARE.
         transition: background 0.2s ease;
       }
 
-      .sidebar::-webkit-scrollbar-thumb:hover,
+      .chat-settings-panel::-webkit-scrollbar-thumb:hover,
       #chat::-webkit-scrollbar-thumb:hover,
       #messages::-webkit-scrollbar-thumb:hover {
         background: rgba(148, 163, 184, 0.4);
       }
 
       /* Firefox - Minimal */
-      .sidebar,
+      .chat-settings-panel,
       #chat,
       #messages {
         scrollbar-width: thin;
@@ -1990,5 +2235,8 @@ SOFTWARE.
         scrollbar-color: rgba(148, 163, 184, 0.15) transparent;
       }
     </style>
+      </div>
+    </main>
+  </div>
   </body>
 </html>

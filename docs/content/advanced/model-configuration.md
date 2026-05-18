@@ -189,8 +189,8 @@ These settings apply to most LLM backends (llama.cpp, vLLM, etc.):
 | Field | Type | Description |
 |-------|------|-------------|
 | `no_mulmatq` | bool | Disable matrix multiplication queuing |
-| `draft_model` | string | Draft model for speculative decoding |
-| `n_draft` | int32 | Number of draft tokens |
+| `draft_model` | string | Draft model GGUF file for speculative decoding (see [Speculative Decoding](#speculative-decoding)) |
+| `n_draft` | int32 | Maximum number of draft tokens per speculative step (default: 16) |
 | `quantization` | string | Quantization format |
 | `load_format` | string | Model load format |
 | `numa` | bool | Enable NUMA (Non-Uniform Memory Access) |
@@ -210,6 +210,237 @@ YARN (Yet Another RoPE extensioN) settings for context extension:
 | `yarn_attn_factor` | float32 | YARN attention factor |
 | `yarn_beta_fast` | float32 | YARN beta fast parameter |
 | `yarn_beta_slow` | float32 | YARN beta slow parameter |
+
+### Speculative Decoding
+
+Speculative decoding speeds up text generation by predicting multiple tokens ahead and verifying them in a single forward pass. The output is identical to normal decoding — only faster. This feature is only available with the `llama-cpp` backend.
+
+There are two approaches:
+
+#### Draft Model Speculative Decoding
+
+Uses a smaller, faster model from the same model family to draft candidate tokens, which the main model then verifies. Requires a separate GGUF file for the draft model.
+
+```yaml
+name: my-model
+backend: llama-cpp
+parameters:
+  model: large-model.gguf
+draft_model: small-draft-model.gguf
+n_draft: 8
+options:
+  - spec_p_min:0.8
+  - draft_gpu_layers:99
+```
+
+#### N-gram Self-Speculative Decoding
+
+Uses patterns from the token history to predict future tokens — no extra model required. Works well for repetitive or structured output (code, JSON, lists).
+
+```yaml
+name: my-model
+backend: llama-cpp
+parameters:
+  model: my-model.gguf
+options:
+  - spec_type:ngram_simple
+  - spec_n_max:16
+```
+
+#### Speculative Decoding Options
+
+These are set via the `options:` array in the model configuration (format: `key:value`):
+
+**Common options**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `spec_type` / `speculative_type` | string | `none` | Speculative decoding type, or comma-separated list to chain multiple (see table below) |
+| `spec_n_max` / `draft_max` | int | 16 | Maximum number of tokens to draft per step |
+| `spec_n_min` / `draft_min` | int | 0 | Minimum draft tokens required to use speculation |
+| `spec_p_min` / `draft_p_min` | float | 0.75 | Minimum probability threshold for greedy acceptance |
+| `spec_p_split` | float | 0.1 | Split probability for tree-based branching |
+
+**Draft-model options** (apply when `spec_type=draft`, i.e. a `draft_model` is configured)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `draft_gpu_layers` | int | -1 | GPU layers for the draft model (-1 = use default) |
+| `draft_threads` / `spec_draft_threads` | int | same as main | Threads used by the draft model (`<= 0` = hardware concurrency) |
+| `draft_threads_batch` / `spec_draft_threads_batch` | int | same as `draft_threads` | Threads used by the draft model during batch / prompt processing |
+| `draft_cache_type_k` / `spec_draft_cache_type_k` | string | `f16` | KV cache K data type for the draft model (same values as `cache_type_k`) |
+| `draft_cache_type_v` / `spec_draft_cache_type_v` | string | `f16` | KV cache V data type for the draft model |
+| `draft_cpu_moe` / `spec_draft_cpu_moe` | bool | false | Keep all MoE expert weights of the draft model on CPU |
+| `draft_n_cpu_moe` / `spec_draft_n_cpu_moe` | int | 0 | Keep MoE expert weights of the first N draft-model layers on CPU |
+| `draft_override_tensor` / `spec_draft_override_tensor` | string | "" | Comma-separated `<tensor regex>=<buffer type>` overrides for the draft model |
+| `draft_ctx_size` | int | (ignored) | Deprecated upstream: the draft now shares the target context size. Accepted for backward compatibility but has no effect. |
+
+**`ngram_simple` options** (used when `spec_type` includes `ngram_simple`)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `spec_ngram_size_n` / `ngram_size_n` | int | 12 | N-gram lookup size |
+| `spec_ngram_size_m` / `ngram_size_m` | int | 48 | M-gram proposal size |
+| `spec_ngram_min_hits` / `ngram_min_hits` | int | 1 | Minimum hits for accepting n-gram proposals |
+
+**`ngram_mod` options** (used when `spec_type` includes `ngram_mod`)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `spec_ngram_mod_n_min` | int | 48 | Minimum number of ngram tokens to use |
+| `spec_ngram_mod_n_max` | int | 64 | Maximum number of ngram tokens to use |
+| `spec_ngram_mod_n_match` | int | 24 | Ngram lookup length |
+
+**`ngram_map_k` options** (used when `spec_type` includes `ngram_map_k`)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `spec_ngram_map_k_size_n` | int | 12 | N-gram lookup size |
+| `spec_ngram_map_k_size_m` | int | 48 | M-gram proposal size |
+| `spec_ngram_map_k_min_hits` | int | 1 | Minimum hits for accepting proposals |
+
+**`ngram_map_k4v` options** (used when `spec_type` includes `ngram_map_k4v`)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `spec_ngram_map_k4v_size_n` | int | 12 | N-gram lookup size |
+| `spec_ngram_map_k4v_size_m` | int | 48 | M-gram proposal size |
+| `spec_ngram_map_k4v_min_hits` | int | 1 | Minimum hits for accepting proposals |
+
+**`ngram_cache` lookup files**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `spec_lookup_cache_static` / `lookup_cache_static` | string | "" | Path to a static ngram lookup cache file |
+| `spec_lookup_cache_dynamic` / `lookup_cache_dynamic` | string | "" | Path to a dynamic ngram lookup cache file (updated by generation) |
+
+#### Speculative Type Values
+
+The canonical names match upstream llama.cpp (dash-separated). For backward compatibility LocalAI also accepts the underscore-separated forms and the bare `draft` / `eagle3` aliases.
+
+| Type | Aliases accepted | Description |
+|------|------------------|-------------|
+| `none` | | No speculative decoding (default) |
+| `draft-simple` | `draft`, `draft_simple` | Draft model-based speculation (auto-set when `draft_model` is configured) |
+| `draft-eagle3` | `eagle3`, `draft_eagle3` | EAGLE3 draft model architecture |
+| `draft-mtp` | `draft_mtp` | Multi-Token Prediction. Reuses the target model's embedded MTP head; no separate draft GGUF required (`draft_model` can be omitted). |
+| `ngram-simple` | `ngram_simple` | Simple self-speculative using token history |
+| `ngram-map-k` | `ngram_map_k` | N-gram with key-only map |
+| `ngram-map-k4v` | `ngram_map_k4v` | N-gram with keys and 4 m-gram values |
+| `ngram-mod` | `ngram_mod` | Modified n-gram speculation |
+| `ngram-cache` | `ngram_cache` | 3-level n-gram cache |
+
+Multiple types can be chained by passing a comma-separated list to `spec_type` (e.g. `spec_type:ngram-simple,ngram-mod`). The runtime tries them in order and accepts the first proposal that meets the acceptance criteria.
+
+{{% notice note %}}
+Speculative decoding is automatically disabled when multimodal models (with `mmproj`) are active. The `n_draft` parameter can also be overridden per-request.
+{{% /notice %}}
+
+##### Multi-Token Prediction (MTP)
+
+`draft-mtp` enables [Multi-Token Prediction](https://github.com/ggml-org/llama.cpp/pull/22673) (ggml-org/llama.cpp#22673). MTP uses a small prediction head trained into the target model: the head runs alongside the main forward pass and proposes the next few tokens, which the target then verifies in a single batched step. Upstream reports ~1.85x-2.1x token throughput at ~72-82% draft acceptance on Qwen3.6 27B / 35B A3B.
+
+**Auto-detection (default).** When a GGUF declares an MTP head (the upstream `<arch>.nextn_predict_layers` metadata key, set by `convert_hf_to_gguf.py` for Qwen3.5/3.6 family models and similar), LocalAI auto-enables MTP with the following defaults:
+
+```yaml
+options:
+  - spec_type:draft-mtp
+  - spec_n_max:6
+  - spec_p_min:0.75
+```
+
+Detection runs both at **import time** (the `/import-model` UI / `POST /models/import-uri` flow range-fetches the GGUF header and writes the options into the generated YAML before you save it) and at **load time** (every llama-cpp model start re-checks the local header and appends the options if `spec_type` isn't already set). To opt out, set an explicit `spec_type:` / `speculative_type:` in your YAML - auto-detection always preserves the user value, including `spec_type:none`.
+
+**Two ways to load the MTP head:**
+
+1. **Embedded in the target GGUF** (the recommended path for LocalAI, and what auto-detection assumes). When `spec_type` includes `draft-mtp` and `draft_model` is empty, the backend builds the MTP draft context directly from the target model's weights. The GGUF must have been converted with the MTP tensors included.
+2. **Separate `mtp-*.gguf` sibling file.** If you point `draft_model` at the separate MTP-head GGUF that ships next to the main weights on HuggingFace, the backend will load it as a draft model. Note: upstream's `-hf` auto-discovery of `mtp-*.gguf` siblings is **not** wired into LocalAI's gRPC layer - you need to download the sibling file and configure `draft_model` explicitly.
+
+**Manual override knobs** (overlap with the auto-detect defaults above):
+
+| Option | Recommended | Notes |
+|--------|------------|-------|
+| `spec_type` | `draft-mtp` | Activates MTP. Can be chained with other types (see below). |
+| `spec_n_max` / `draft_max` | `2`-`6` | Number of draft tokens per step. Upstream's PR suggests 2-3 for the tightest acceptance window; LocalAI's auto-default is 6 to favour throughput on models with high acceptance. |
+| `spec_p_min` | `0.75` | Pinned because upstream marks the current default with a "change to 0.0f" TODO; locking it here keeps acceptance thresholds stable across future llama.cpp bumps. |
+| `mmproj_use_gpu` | `false` (or unset `mmproj`) | MTP has a prompt-processing overhead; if the model is non-vision, drop the mmproj entirely to save VRAM. |
+
+**Minimal config** (override-only, since auto-detection already covers this for MTP-capable GGUFs):
+
+```yaml
+name: qwen3-mtp
+backend: llama-cpp
+parameters:
+  model: qwen3-27b-with-mtp.gguf
+options:
+  - spec_type:draft-mtp
+  - spec_n_max:3
+```
+
+**With a separate MTP head file:**
+
+```yaml
+name: qwen3-mtp
+backend: llama-cpp
+parameters:
+  model: qwen3-27b.gguf
+  draft_model: qwen3-27b-mtp-head.gguf
+options:
+  - spec_type:draft-mtp
+  - spec_n_max:3
+```
+
+**Chaining MTP with n-gram fallback** (experimental, from the PR's usage notes - useful when MTP acceptance drops on highly repetitive output):
+
+```yaml
+options:
+  - spec_type:draft-mtp,ngram-mod
+  - spec_n_max:3
+  - spec_ngram_mod_n_match:24
+```
+
+Pre-converted GGUFs with MTP heads are published on the [ggml-org HuggingFace org](https://huggingface.co/ggml-org) (initially Qwen3.6 27B and Qwen3.6 35B A3B).
+
+### Reasoning Models (DeepSeek-R1, Qwen3, etc.)
+
+These load-time options control how the backend parses `<think>` reasoning blocks and how much budget the model is allowed for thinking. They are set per model via the `options:` array.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `reasoning_format` | string | `deepseek` | Parser for reasoning/thinking blocks. One of `none`, `auto`, `deepseek`, `deepseek-legacy` (alias `deepseek_legacy`). |
+| `enable_reasoning` / `reasoning_budget` | int | `-1` | Reasoning budget in tokens: `-1` unlimited, `0` disabled, `>0` token cap for the thinking section. |
+| `prefill_assistant` | bool | `true` | When `false`, the trailing assistant message is not pre-filled by the chat template. |
+
+{{% notice note %}}
+This is the load-time reasoning configuration. The orthogonal per-request `enable_thinking` chat-template kwarg (set via the YAML `reasoning.disable` field) toggles thinking on/off per call without restarting the model.
+{{% /notice %}}
+
+### Multimodal Backend Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `mmproj_use_gpu` / `mmproj_offload` | bool | `true` | Set `false` to keep the multimodal projector on CPU (saves VRAM at cost of speed). |
+| `image_min_tokens` | int | `-1` | Minimum vision tokens per image. `-1` keeps the model default. |
+| `image_max_tokens` | int | `-1` | Maximum vision tokens per image. `-1` keeps the model default. |
+
+### Embedding & Reranking Backend Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pooling_type` / `pooling` | string | auto | Pooling strategy for embeddings: `none`, `mean`, `cls`, `last`, `rank`. Reranking automatically uses `rank`. |
+| `embd_normalize` / `embedding_normalize` | int | `2` | Normalization: `-1` none, `0` max-abs, `1` taxicab, `2` Euclidean (L2), `>2` p-norm. |
+
+### Other Backend Tuning Options
+
+These llama.cpp options are passed through the `options:` array.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `n_ubatch` / `ubatch` | int | same as `batch` | Physical batch size. Decouple from `n_batch` when an embedding/rerank workload needs a different value. |
+| `threads_batch` / `n_threads_batch` | int | same as `threads` | Threads used during prompt processing. `<= 0` means `hardware_concurrency()`. |
+| `direct_io` / `use_direct_io` | bool | `false` | Open the model with `O_DIRECT` (faster cold loads on NVMe; ignored if not supported). |
+| `verbosity` | int | `3` | llama.cpp internal log verbosity threshold. Higher = more verbose. |
+| `override_tensor` / `tensor_buft_overrides` | string | "" | Per-tensor buffer-type overrides for the main model. Format: `<tensor regex>=<buffer type>,<tensor regex>=<buffer type>,...`. Mirrors the existing `draft_override_tensor` syntax for the draft model. |
 
 ### Prompt Caching
 
@@ -250,8 +481,8 @@ These options apply when using the `vllm` backend:
 | `disable_log_stats` | bool | Disable logging statistics |
 | `dtype` | string | Data type (e.g., `float16`, `bfloat16`) |
 | `flash_attention` | string | Flash attention configuration |
-| `cache_type_k` | string | Key cache type |
-| `cache_type_v` | string | Value cache type |
+| `cache_type_k` | string | Key cache quantization type. Maps to llama.cpp's `-ctk`. Accepted values for llama.cpp-family backends (`llama-cpp`, `ik-llama-cpp`, `turboquant`): `f16`, `f32`, `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1`. The `turboquant` backend additionally accepts `turbo2`, `turbo3`, `turbo4` — the fork's TurboQuant KV-cache schemes. `turbo3`/`turbo4` auto-enable flash_attention. |
+| `cache_type_v` | string | Value cache quantization type. Maps to llama.cpp's `-ctv`. Same accepted values as `cache_type_k`. Note: any quantized V cache requires flash_attention to be enabled. |
 | `limit_mm_per_prompt` | object | Limit multimodal content per prompt: `{image: int, video: int, audio: int}` |
 
 ## Template Configuration
@@ -397,9 +628,117 @@ Agent/autonomous agent configuration:
 | `agent.enable_mcp_prompts` | bool | Enable MCP prompts |
 | `agent.enable_plan_re_evaluator` | bool | Enable plan re-evaluation |
 
+## Reasoning Configuration
+
+Configure how reasoning tags are extracted and processed from model output. Reasoning tags are used by models like DeepSeek, Command-R, and others to include internal reasoning steps in their responses.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `reasoning.disable` | bool | `false` | When `true`, disables reasoning extraction entirely. The original content is returned without any processing. |
+| `reasoning.disable_reasoning_tag_prefill` | bool | `false` | When `true`, disables automatic prepending of thinking start tokens. Use this when your model already includes reasoning tags in its output format. |
+| `reasoning.strip_reasoning_only` | bool | `false` | When `true`, extracts and removes reasoning tags from content but discards the reasoning text. Useful when you want to clean reasoning tags from output without storing the reasoning content. |
+| `reasoning.thinking_start_tokens` | array | `[]` | List of custom thinking start tokens to detect in prompts. Custom tokens are checked before default tokens. |
+| `reasoning.tag_pairs` | array | `[]` | List of custom tag pairs for reasoning extraction. Each entry has `start` and `end` fields. Custom pairs are checked before default pairs. |
+
+### Reasoning Tag Formats
+
+The reasoning extraction supports multiple tag formats used by different models:
+
+- `<thinking>...</thinking>` - General thinking tag
+- `<think>...</think>` - DeepSeek, Granite, ExaOne, GLM models
+- `<|START_THINKING|>...<|END_THINKING|>` - Command-R models
+- `<|inner_prefix|>...<|inner_suffix|>` - Apertus models
+- `<seed:think>...</seed:think>` - Seed models
+- `<|think|>...<|end|><|begin|>assistant<|content|>` - Solar Open models
+- `[THINK]...[/THINK]` - Magistral models
+
+### Examples
+
+**Disable reasoning extraction:**
+```yaml
+reasoning:
+  disable: true
+```
+
+**Extract reasoning but don't prepend tags:**
+```yaml
+reasoning:
+  disable_reasoning_tag_prefill: true
+```
+
+**Strip reasoning tags without storing reasoning content:**
+```yaml
+reasoning:
+  strip_reasoning_only: true
+```
+
+**Complete example with reasoning configuration:**
+```yaml
+name: deepseek-model
+backend: llama-cpp
+parameters:
+  model: deepseek.gguf
+
+reasoning:
+  disable: false
+  disable_reasoning_tag_prefill: false
+  strip_reasoning_only: false
+```
+
+**Example with custom tokens and tag pairs:**
+```yaml
+name: custom-reasoning-model
+backend: llama-cpp
+parameters:
+  model: custom.gguf
+
+reasoning:
+  thinking_start_tokens:
+    - "<custom:think>"
+    - "<my:reasoning>"
+  tag_pairs:
+    - start: "<custom:think>"
+      end: "</custom:think>"
+    - start: "<my:reasoning>"
+      end: "</my:reasoning>"
+```
+
+**Note:** Custom tokens and tag pairs are checked before the default ones, giving them priority. This allows you to override default behavior or add support for new reasoning tag formats.
+
+### Per-Request Override via Metadata
+
+The `reasoning.disable` setting from model configuration can be overridden on a per-request basis using the `metadata` field in the OpenAI chat completion request. This allows you to enable or disable thinking for individual requests without changing the model configuration.
+
+The `metadata` field accepts a `map[string]string` that is forwarded to the backend. The `enable_thinking` key controls thinking behavior:
+
+```bash
+# Enable thinking for a single request (overrides model config)
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3",
+    "messages": [{"role": "user", "content": "Explain quantum computing"}],
+    "metadata": {"enable_thinking": "true"}
+  }'
+
+# Disable thinking for a single request (overrides model config)
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "metadata": {"enable_thinking": "false"}
+  }'
+```
+
+**Priority order:**
+1. Request-level `metadata.enable_thinking` (highest priority)
+2. Model config `reasoning.disable` (fallback)
+3. Auto-detected from model template (default)
+
 ## Pipeline Configuration
 
-Define pipelines for audio-to-audio processing:
+Define pipelines for audio-to-audio processing and the [Realtime API]({{%relref "features/openai-realtime" %}}):
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -502,3 +841,20 @@ feature_flags:
 - See [Prompt Templates]({{%relref "advanced/advanced-usage#prompt-templates" %}}) for template examples
 - See [CLI Reference]({{%relref "reference/cli-reference" %}}) for command-line options
 
+
+### GPU Auto-Fit Mode
+
+**Note**: By default, LocalAI sets `gpu_layers` to a very large value (9999999), which effectively disables llama-cpp's auto-fit functionality. This is intentional to work with LocalAI's VRAM-based model unloading mechanism.
+
+To enable llama-cpp's auto-fit mode, set `gpu_layers: -1` in your model configuration. However, be aware of the following:
+
+1. **Trade-off**: Enabling auto-fit conflicts with LocalAI's built-in VRAM threshold-based unloading. Auto-fit attempts to fit all tensors into GPU memory automatically, while LocalAI's unloading mechanism removes models when VRAM usage exceeds thresholds.
+
+2. **Known Issues**: Setting `gpu_layers: -1` may trigger `tensor_buft_override` buffer errors in some configurations, particularly when the model exceeds available GPU memory.
+
+3. **Recommendation**: 
+   - Use the default settings for most use cases (LocalAI manages VRAM automatically)
+   - Only enable `gpu_layers: -1` if you understand the implications and have tested on your specific hardware
+   - Monitor VRAM usage carefully when using auto-fit mode
+
+This is a known limitation being tracked in issue [#8562](https://github.com/mudler/LocalAI/issues/8562). A future implementation may provide a runtime toggle or custom logic to reconcile auto-fit with threshold-based unloading.

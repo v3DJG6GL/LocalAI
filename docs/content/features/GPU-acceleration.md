@@ -1,19 +1,11 @@
 +++
 disableToc = false
-title = "⚡ GPU acceleration"
+title = "GPU Acceleration"
 weight = 9
 url = "/features/gpu-acceleration/"
 +++
 
-{{% notice context="warning" %}}
-Section under construction
- {{% /notice %}}
-
-This section contains instruction on how to use LocalAI with GPU acceleration.
-
-{{% notice icon="⚡" context="warning" %}}
-For acceleration for AMD or Metal HW is still in development, for additional details see the [build]({{%relref "installation/build#Acceleration" %}})
- {{% /notice %}}
+This page covers how to use LocalAI with GPU acceleration across different hardware vendors. For container image tags and registry details, see [Container Images]({{%relref "getting-started/container-images" %}}). For memory management with multiple GPU-accelerated models, see [VRAM Management]({{%relref "advanced/vram-management" %}}).
 
 ## Automatic Backend Detection
 
@@ -60,6 +52,43 @@ diffusers:
   scheduler_type: "k_dpmpp_sde"
 ```
 
+### Multi-GPU Support
+
+#### llama.cpp
+
+For llama.cpp models, you can control which GPU layers are offloaded using `gpu_layers`. When multiple NVIDIA GPUs are present, llama.cpp distributes layers across available devices automatically. You can control GPU visibility with the `CUDA_VISIBLE_DEVICES` environment variable:
+
+```bash
+# Use only GPU 0 and GPU 1
+docker run --gpus all -e CUDA_VISIBLE_DEVICES=0,1 ...
+```
+
+For AMD GPUs, use `HIP_VISIBLE_DEVICES` instead:
+
+```bash
+docker run --device /dev/dri --device /dev/kfd -e HIP_VISIBLE_DEVICES=0,1 ...
+```
+
+#### diffusers
+
+For multi-GPU support with diffusers, configure the model with `tensor_parallel_size` set to the number of GPUs you want to use.
+
+```yaml
+name: stable-diffusion-multigpu
+model: stabilityai/stable-diffusion-xl-base-1.0
+backend: diffusers
+parameters:
+  tensor_parallel_size: 2 # Number of GPUs to use
+```
+
+The `tensor_parallel_size` parameter is set in the gRPC proto configuration (in `ModelOptions` message, field 55). When this is set to a value greater than 1, the diffusers backend automatically enables `device_map="auto"` to distribute the model across multiple GPUs.
+
+#### Tips
+
+- For optimal performance, use GPUs of the same type and memory capacity.
+- Ensure you have sufficient GPU memory across all devices.
+- When running multiple models concurrently, consider using [VRAM Management]({{%relref "advanced/vram-management" %}}) to automatically unload idle models.
+
 ## CUDA(NVIDIA) acceleration
 
 ### Requirements
@@ -82,6 +111,7 @@ The image list is on [quay](https://quay.io/repository/go-skynet/local-ai?tab=ta
 
 - CUDA `11` tags: `master-gpu-nvidia-cuda-11`, `v1.40.0-gpu-nvidia-cuda-11`, ...
 - CUDA `12` tags: `master-gpu-nvidia-cuda-12`, `v1.40.0-gpu-nvidia-cuda-12`, ...
+- CUDA `13` tags: `master-gpu-nvidia-cuda-13`, `v1.40.0-gpu-nvidia-cuda-13`, ...
 
 In addition to the commands to run LocalAI normally, you need to specify `--gpus all` to docker, for example:
 
@@ -121,15 +151,15 @@ llama_init_from_file: kv self size  =  512.00 MB
 
 ## ROCM(AMD) acceleration
 
-There are a limited number of tested configurations for ROCm systems however most newer deditated GPU consumer grade devices seem to be supported under the current ROCm6 implementation.
+There are a limited number of tested configurations for ROCm systems however most newer dedicated GPU consumer grade devices seem to be supported under the current ROCm 7 implementation.
 
 Due to the nature of ROCm it is best to run all implementations in containers as this limits the number of packages required for installation on host system, compatibility and package versions for dependencies across all variations of OS must be tested independently if desired, please refer to the [build]({{%relref "installation/build#Acceleration" %}}) documentation.
 
 ### Requirements
 
-- `ROCm 6.x.x` compatible GPU/accelerator
-- OS: `Ubuntu` (22.04, 20.04), `RHEL` (9.3, 9.2, 8.9, 8.8), `SLES` (15.5, 15.4)
-- Installed to host: `amdgpu-dkms` and `rocm` >=6.0.0 as per ROCm documentation.
+- `ROCm 7.x.x` compatible GPU/accelerator
+- OS: `Ubuntu` (24.04, 22.04), `RHEL` (9.x), `SLES` (15.x)
+- Installed to host: `amdgpu-dkms` and `rocm` >=7.0.0 as per ROCm documentation.
 
 ### Recommendations
 
@@ -141,29 +171,23 @@ Due to the nature of ROCm it is best to run all implementations in containers as
 Ongoing verification testing of ROCm compatibility with integrated backends.
 Please note the following list of verified backends and devices.
 
-LocalAI hipblas images are built against the following targets: gfx900,gfx906,gfx908,gfx940,gfx941,gfx942,gfx90a,gfx1030,gfx1031,gfx1100,gfx1101
+LocalAI hipblas images are built against the following targets: gfx908, gfx90a, gfx942, gfx950, gfx1030, gfx1100, gfx1101, gfx1102, gfx1200, gfx1201
 
-If your device is not one of these you must specify the corresponding `GPU_TARGETS` and specify `REBUILD=true`. Otherwise you don't need to specify these in the commands below.
+**Note:** Starting with ROCm 6.4, AMD removed rocBLAS kernel support for older architectures (gfx803, gfx900, gfx906). Since llama.cpp and other backends depend on rocBLAS for matrix operations, these GPUs (e.g. Radeon VII) are no longer supported in pre-built images.
+
+If your device is not one of the above targets, you must specify the corresponding `GPU_TARGETS` and specify `REBUILD=true`. However, rebuilding will not help for architectures that lack rocBLAS kernel support in your ROCm version.
 
 ### Verified
 
-The devices in the following list have been tested with `hipblas` images running `ROCm 6.0.0`
+The devices in the following list have been tested with `hipblas` images.
 
 | Backend | Verified | Devices |
 | ---- | ---- | ---- |
-| llama.cpp | yes | Radeon VII (gfx906) |
-| diffusers | yes | Radeon VII (gfx906) |
-| piper | yes | Radeon VII (gfx906) |
+| llama.cpp | yes | MI100 (gfx908), MI210/250 (gfx90a) |
+| diffusers | yes | MI100 (gfx908), MI210/250 (gfx90a) |
 | whisper | no | none |
-| bark | no | none |
 | coqui | no | none |
 | transformers | no | none |
-| exllama | no | none |
-| exllama2 | no | none |
-| mamba | no | none |
-| sentencetransformers | no | none |
-| transformers-musicgen | no | none |
-| vall-e-x | no | none |
 | vllm | no | none |
 
 **You can help by expanding this list.**
@@ -171,8 +195,8 @@ The devices in the following list have been tested with `hipblas` images running
 ### System Prep
 
 1. Check your GPU LLVM target is compatible with the version of ROCm. This can be found in the [LLVM Docs](https://llvm.org/docs/AMDGPUUsage.html).
-2. Check which ROCm version is compatible with your LLVM target and your chosen OS (pay special attention to supported kernel versions). See the following for compatibility for ([ROCm 6.0.0](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-6.0.0/reference/system-requirements.html)) or ([ROCm 6.0.2](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html))
-3. Install you chosen version of the `dkms` and `rocm` (it is recommended that the native package manager be used for this process for any OS as version changes are executed more easily via this method if updates are required). Take care to restart after installing `amdgpu-dkms` and before installing `rocm`, for details regarding this see the installation documentation for your chosen OS ([6.0.2](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/native-install/index.html) or [6.0.0](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-6.0.0/how-to/native-install/index.html))
+2. Check which ROCm version is compatible with your LLVM target and your chosen OS (pay special attention to supported kernel versions). See the [ROCm compatibility matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html).
+3. Install your chosen version of the `dkms` and `rocm` (it is recommended that the native package manager be used for this process for any OS as version changes are executed more easily via this method if updates are required). Take care to restart after installing `amdgpu-dkms` and before installing `rocm`, for details regarding this see the [ROCm installation documentation](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/native-install/index.html).
 4. Deploy. Yes it's that easy.
 
 #### Setup Example (Docker/containerd)
@@ -181,13 +205,13 @@ The following are examples of the ROCm specific configuration elements required.
 
 ```yaml
     # For full functionality select a non-'core' image, version locking the image is recommended for debug purposes.
-    image: quay.io/go-skynet/local-ai:master-aio-gpu-hipblas
+    image: quay.io/go-skynet/local-ai:master-gpu-hipblas
     environment:
       - DEBUG=true
       # If your gpu is not already included in the current list of default targets the following build details are required.
       - REBUILD=true
       - BUILD_TYPE=hipblas
-      - GPU_TARGETS=gfx906 # Example for Radeon VII
+      - GPU_TARGETS=gfx1100 # Example for RX 7900 XTX
     devices:
       # AMD GPU only require the following devices be passed through to the container for offloading to occur.
       - /dev/dri
@@ -201,15 +225,13 @@ docker run \
  -e DEBUG=true \
  -e REBUILD=true \
  -e BUILD_TYPE=hipblas \
- -e GPU_TARGETS=gfx906 \
+ -e GPU_TARGETS=gfx1100 \
  --device /dev/dri \
  --device /dev/kfd \
- quay.io/go-skynet/local-ai:master-aio-gpu-hipblas
+ quay.io/go-skynet/local-ai:master-gpu-hipblas
 ```
 
 Please ensure to add all other required environment variables, port forwardings, etc to your `compose` file or `run` command.
-
-The rebuild process will take some time to complete when deploying these containers and it is recommended that you `pull` the image prior to deployment as depending on the version these images may be ~20GB in size.
 
 #### Example (k8s) (Advanced Deployment/WIP)
 
@@ -318,3 +340,110 @@ docker run -p 8080:8080 -e DEBUG=true -v $PWD/models:/models \
 --device /dev/dri --device /dev/kfd \ # AMD/Intel passthrough
 localai/localai:latest-gpu-vulkan
 ```
+
+## NVIDIA L4T (Jetson/ARM64) acceleration
+
+LocalAI supports NVIDIA ARM64 devices including Jetson Nano, Jetson Xavier NX, Jetson AGX Orin, and DGX Spark. Pre-built container images are available for both CUDA 12 and CUDA 13.
+
+For detailed setup instructions, platform compatibility, and build commands, see the dedicated [Running on Nvidia ARM64]({{%relref "reference/nvidia-l4t" %}}) page.
+
+### Quick start
+
+```bash
+# Jetson AGX Orin (CUDA 12)
+docker run -e DEBUG=true -p 8080:8080 -v $PWD/models:/models \
+  --runtime nvidia --gpus all \
+  quay.io/go-skynet/local-ai:latest-nvidia-l4t-arm64
+
+# DGX Spark (CUDA 13)
+docker run -e DEBUG=true -p 8080:8080 -v $PWD/models:/models \
+  --runtime nvidia --gpus all \
+  quay.io/go-skynet/local-ai:latest-nvidia-l4t-arm64-cuda-13
+```
+
+## GPU monitoring
+
+Use these vendor-specific tools to verify that LocalAI is using your GPU and to monitor resource usage during inference.
+
+### NVIDIA
+
+```bash
+# Real-time GPU utilization, memory, temperature
+nvidia-smi
+
+# Continuous monitoring (updates every 1 second)
+nvidia-smi --loop=1
+
+# Inside a container
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
+```
+
+Look for non-zero **GPU-Util** and **Memory-Usage** values while running inference to confirm GPU acceleration is active.
+
+### AMD
+
+```bash
+# ROCm System Management Interface
+rocm-smi
+
+# Continuous monitoring
+watch -n1 rocm-smi
+
+# Show detailed GPU info
+rocm-smi --showallinfo
+```
+
+### Intel
+
+```bash
+# Intel GPU top (part of intel-gpu-tools)
+sudo intel_gpu_top
+
+# List available Intel GPUs
+sycl-ls
+```
+
+## Troubleshooting
+
+### GPU not detected in container
+
+- **NVIDIA**: Ensure `nvidia-container-toolkit` is installed and the Docker runtime is configured. Test with `docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi`.
+- **AMD**: Ensure `/dev/dri` and `/dev/kfd` are passed to the container and that `amdgpu-dkms` is installed on the host.
+- **Intel**: Ensure `/dev/dri` is passed to the container and Intel GPU drivers are installed on the host.
+
+### Model loads on CPU instead of GPU
+
+- Check that `gpu_layers` is set in your model YAML configuration. Setting it to a high number (e.g., `999`) offloads all possible layers to GPU.
+- Verify you are using a GPU-enabled container image (tags containing `gpu-nvidia-cuda`, `gpu-hipblas`, `gpu-intel`, etc.).
+- Enable `DEBUG=true` and check the logs for GPU initialization messages.
+
+### Out of memory (OOM) errors
+
+- Reduce `gpu_layers` to offload fewer layers, keeping some on CPU.
+- Lower `context_size` to reduce VRAM usage.
+- Use [VRAM Management]({{%relref "advanced/vram-management" %}}) to automatically unload idle models when running multiple models.
+- Use quantized models (e.g., Q4_K_M) which require less memory than full-precision models.
+
+### ROCm: unsupported GPU target
+
+If your AMD GPU is not in the default target list, set `REBUILD=true` and `GPU_TARGETS` to your device's gfx target:
+
+```bash
+docker run -e REBUILD=true -e BUILD_TYPE=hipblas -e GPU_TARGETS=gfx1030 \
+  --device /dev/dri --device /dev/kfd \
+  quay.io/go-skynet/local-ai:master-gpu-hipblas
+```
+
+### Intel SYCL: model hangs
+
+SYCL has a known issue where models hang when `mmap: true` is set. Ensure `mmap` is disabled in the model configuration:
+
+```yaml
+mmap: false
+```
+
+### Slow performance or unexpected CPU fallback
+
+- Ensure `f16: true` is set in the model YAML for GPU-accelerated backends.
+- Set `threads: 1` when using full GPU offloading to avoid CPU thread contention.
+- Verify the correct `BUILD_TYPE` matches your hardware (e.g., `cublas` for NVIDIA, `hipblas` for AMD).

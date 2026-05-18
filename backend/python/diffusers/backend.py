@@ -22,6 +22,10 @@ import backend_pb2
 import backend_pb2_grpc
 
 import grpc
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
+from grpc_auth import get_auth_interceptors
+
 
 # Import dynamic loader for pipeline discovery
 from diffusers_dynamic_loader import (
@@ -36,13 +40,51 @@ from diffusers import DiffusionPipeline, ControlNetModel
 from diffusers import FluxPipeline, FluxTransformer2DModel, AutoencoderKLWan
 from diffusers.pipelines.stable_diffusion import safety_checker
 from diffusers.utils import load_image, export_to_video
-from compel import Compel, ReturnedEmbeddingsType
+# TODO: re-enable compel as a hard dependency once it supports transformers >= 5.
+# Tracking upstream: https://github.com/damian0815/compel/pull/129
+# and https://github.com/damian0815/compel/issues/128
+# Until then compel pins transformers ~= 4.25, which forces the pip resolver into
+# multi-hour backtracking storms in CI when DEPS_REFRESH rotates the cache.
+# Keep the import optional and gate usage on the COMPEL env var (set COMPEL=1 to opt in).
+try:
+    from compel import Compel, ReturnedEmbeddingsType
+    COMPEL_AVAILABLE = True
+except ImportError:
+    Compel = None
+    ReturnedEmbeddingsType = None
+    COMPEL_AVAILABLE = False
 from optimum.quanto import freeze, qfloat8, quantize
 from transformers import T5EncoderModel
 from safetensors.torch import load_file
+# Try to import sd_embed - it might not always be available
+try:
+    from sd_embed.embedding_funcs import (
+        get_weighted_text_embeddings_sd15,
+        get_weighted_text_embeddings_sdxl,
+        get_weighted_text_embeddings_sd3,
+        get_weighted_text_embeddings_flux1,
+    )
+    SD_EMBED_AVAILABLE = True
+except ImportError:
+    get_weighted_text_embeddings_sd15 = None
+    get_weighted_text_embeddings_sdxl = None
+    get_weighted_text_embeddings_sd3 = None
+    get_weighted_text_embeddings_flux1 = None
+    SD_EMBED_AVAILABLE = False
+
+# Import LTX-2 specific utilities
+from diffusers.pipelines.ltx2.export_utils import encode_video as ltx2_encode_video
+from diffusers import LTX2VideoTransformer3DModel, GGUFQuantizationConfig
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 COMPEL = os.environ.get("COMPEL", "0") == "1"
+if COMPEL and not COMPEL_AVAILABLE:
+    print("WARNING: COMPEL is enabled but the compel module is not installed. Install it manually (`pip install compel`) or unset COMPEL. Falling back to standard prompt processing.", file=sys.stderr)
+    COMPEL = False
+SD_EMBED = os.environ.get("SD_EMBED", "0") == "1"
+# Warn if SD_EMBED is enabled but the module is not available
+if SD_EMBED and not SD_EMBED_AVAILABLE:
+    print("WARNING: SD_EMBED is enabled but sd_embed module is not available. Falling back to standard prompt processing.", file=sys.stderr)
 XPU = os.environ.get("XPU", "0") == "1"
 CLIPSKIP = os.environ.get("CLIPSKIP", "1") == "1"
 SAFETENSORS = os.environ.get("SAFETENSORS", "1") == "1"
@@ -173,7 +215,7 @@ def get_scheduler(name: str, config: dict = {}):
 # Implement the BackendServicer class with the service methods
 class BackendServicer(backend_pb2_grpc.BackendServicer):
 
-    def _load_pipeline(self, request, modelFile, fromSingleFile, torchType, variant):
+    def _load_pipeline(self, request, modelFile, fromSingleFile, torchType, variant, device_map=None):
         """
         Load a diffusers pipeline dynamically using the dynamic loader.
 
@@ -187,6 +229,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             fromSingleFile: Whether to use from_single_file() vs from_pretrained()
             torchType: The torch dtype to use
             variant: Model variant (e.g., "fp16")
+            device_map: Device mapping strategy (e.g., "auto" for multi-GPU)
 
         Returns:
             The loaded pipeline instance
@@ -208,14 +251,14 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             dtype = torch.bfloat16
             bfl_repo = os.environ.get("BFL_REPO", "ChuckMcSneed/FLUX.1-dev")
 
-            transformer = FluxTransformer2DModel.from_single_file(modelFile, torch_dtype=dtype)
+            transformer = FluxTransformer2DModel.from_single_file(modelFile, torch_dtype=dtype, device_map=device_map)
             quantize(transformer, weights=qfloat8)
             freeze(transformer)
-            text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype)
+            text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, device_map=device_map)
             quantize(text_encoder_2, weights=qfloat8)
             freeze(text_encoder_2)
 
-            pipe = FluxPipeline.from_pretrained(bfl_repo, transformer=None, text_encoder_2=None, torch_dtype=dtype)
+            pipe = FluxPipeline.from_pretrained(bfl_repo, transformer=None, text_encoder_2=None, torch_dtype=dtype, device_map=device_map)
             pipe.transformer = transformer
             pipe.text_encoder_2 = text_encoder_2
 
@@ -228,13 +271,15 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             vae = AutoencoderKLWan.from_pretrained(
                 request.Model,
                 subfolder="vae",
-                torch_dtype=torch.float32
+                torch_dtype=torch.float32,
+                device_map=device_map
             )
             pipe = load_diffusers_pipeline(
                 class_name="WanPipeline",
                 model_id=request.Model,
                 vae=vae,
-                torch_dtype=torchType
+                torch_dtype=torchType,
+                device_map=device_map
             )
             self.txt2vid = True
             return pipe
@@ -244,13 +289,15 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             vae = AutoencoderKLWan.from_pretrained(
                 request.Model,
                 subfolder="vae",
-                torch_dtype=torch.float32
+                torch_dtype=torch.float32,
+                device_map=device_map
             )
             pipe = load_diffusers_pipeline(
                 class_name="WanImageToVideoPipeline",
                 model_id=request.Model,
                 vae=vae,
-                torch_dtype=torchType
+                torch_dtype=torchType,
+                device_map=device_map
             )
             self.img2vid = True
             return pipe
@@ -261,7 +308,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 class_name="SanaPipeline",
                 model_id=request.Model,
                 variant="bf16",
-                torch_dtype=torch.bfloat16
+                torch_dtype=torch.bfloat16,
+                device_map=device_map
             )
             pipe.vae.to(torch.bfloat16)
             pipe.text_encoder.to(torch.bfloat16)
@@ -273,7 +321,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             pipe = load_diffusers_pipeline(
                 class_name="DiffusionPipeline",
                 model_id=request.Model,
-                torch_dtype=torchType
+                torch_dtype=torchType,
+                device_map=device_map
             )
             return pipe
 
@@ -284,8 +333,115 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 class_name="StableVideoDiffusionPipeline",
                 model_id=request.Model,
                 torch_dtype=torchType,
-                variant=variant
+                variant=variant,
+                device_map=device_map
             )
+            if not DISABLE_CPU_OFFLOAD:
+                pipe.enable_model_cpu_offload()
+            return pipe
+
+        # LTX2ImageToVideoPipeline - needs img2vid flag, CPU offload, and special handling
+        if pipeline_type == "LTX2ImageToVideoPipeline":
+            self.img2vid = True
+            self.ltx2_pipeline = True
+            
+            # Check if loading from single file (GGUF)
+            if fromSingleFile and LTX2VideoTransformer3DModel is not None:
+                _, single_file_ext = os.path.splitext(modelFile)
+                if single_file_ext == ".gguf":
+                    # Load transformer from single GGUF file with quantization
+                    transformer_kwargs = {}
+                    quantization_config = GGUFQuantizationConfig(compute_dtype=torchType)
+                    transformer_kwargs["quantization_config"] = quantization_config
+                    
+                    transformer = LTX2VideoTransformer3DModel.from_single_file(
+                        modelFile,
+                        config=request.Model,  # Use request.Model as the config/model_id
+                        subfolder="transformer",
+                        device_map=device_map,
+                        **transformer_kwargs,
+                    )
+                    
+                    # Load pipeline with custom transformer
+                    pipe = load_diffusers_pipeline(
+                        class_name="LTX2ImageToVideoPipeline",
+                        model_id=request.Model,
+                        transformer=transformer,
+                        torch_dtype=torchType,
+                        device_map=device_map,
+                    )
+                else:
+                    # Single file but not GGUF - use standard single file loading
+                    pipe = load_diffusers_pipeline(
+                        class_name="LTX2ImageToVideoPipeline",
+                        model_id=modelFile,
+                        from_single_file=True,
+                        torch_dtype=torchType,
+                        device_map=device_map,
+                    )
+            else:
+                # Standard loading from pretrained
+                pipe = load_diffusers_pipeline(
+                    class_name="LTX2ImageToVideoPipeline",
+                    model_id=request.Model,
+                    torch_dtype=torchType,
+                    variant=variant,
+                    device_map=device_map
+                )
+            
+            if not DISABLE_CPU_OFFLOAD:
+                pipe.enable_model_cpu_offload()
+            return pipe
+
+        # LTX2Pipeline - text-to-video pipeline, needs txt2vid flag, CPU offload, and special handling
+        if pipeline_type == "LTX2Pipeline":
+            self.txt2vid = True
+            self.ltx2_pipeline = True
+            
+            # Check if loading from single file (GGUF)
+            if fromSingleFile and LTX2VideoTransformer3DModel is not None:
+                _, single_file_ext = os.path.splitext(modelFile)
+                if single_file_ext == ".gguf":
+                    # Load transformer from single GGUF file with quantization
+                    transformer_kwargs = {}
+                    quantization_config = GGUFQuantizationConfig(compute_dtype=torchType)
+                    transformer_kwargs["quantization_config"] = quantization_config
+                    
+                    transformer = LTX2VideoTransformer3DModel.from_single_file(
+                        modelFile,
+                        config=request.Model,  # Use request.Model as the config/model_id
+                        subfolder="transformer",
+                        device_map=device_map,
+                        **transformer_kwargs,
+                    )
+                    
+                    # Load pipeline with custom transformer
+                    pipe = load_diffusers_pipeline(
+                        class_name="LTX2Pipeline",
+                        model_id=request.Model,
+                        transformer=transformer,
+                        torch_dtype=torchType,
+                        device_map=device_map,
+                    )
+                else:
+                    # Single file but not GGUF - use standard single file loading
+                    pipe = load_diffusers_pipeline(
+                        class_name="LTX2Pipeline",
+                        model_id=modelFile,
+                        from_single_file=True,
+                        torch_dtype=torchType,
+                        device_map=device_map,
+                    )
+            else:
+                # Standard loading from pretrained
+                pipe = load_diffusers_pipeline(
+                    class_name="LTX2Pipeline",
+                    model_id=request.Model,
+                    torch_dtype=torchType,
+                    variant=variant,
+                    device_map=device_map
+                )
+            
             if not DISABLE_CPU_OFFLOAD:
                 pipe.enable_model_cpu_offload()
             return pipe
@@ -305,6 +461,10 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         # Add use_safetensors for from_pretrained
         if not fromSingleFile:
             load_kwargs["use_safetensors"] = SAFETENSORS
+
+        # Add device_map for multi-GPU support (when TensorParallelSize > 1)
+        if device_map:
+            load_kwargs["device_map"] = device_map
 
         # Determine pipeline class name - default to AutoPipelineForText2Image
         effective_pipeline_type = pipeline_type if pipeline_type else "AutoPipelineForText2Image"
@@ -404,6 +564,16 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             fromSingleFile = request.Model.startswith("http") or request.Model.startswith("/") or local
             self.img2vid = False
             self.txt2vid = False
+            self.ltx2_pipeline = False
+
+            print(f"LoadModel: PipelineType from request: {request.PipelineType}", file=sys.stderr)
+
+            # Determine device_map for multi-GPU support based on TensorParallelSize
+            # When TensorParallelSize > 1, use device_map='auto' to distribute model across GPUs
+            device_map = None
+            if hasattr(request, 'TensorParallelSize') and request.TensorParallelSize > 1:
+                device_map = "auto"
+                print(f"LoadModel: Multi-GPU mode enabled with TensorParallelSize={request.TensorParallelSize}, using device_map='auto'", file=sys.stderr)
 
             # Load pipeline using dynamic loader
             # Special cases that require custom initialization are handled first
@@ -412,8 +582,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 modelFile=modelFile,
                 fromSingleFile=fromSingleFile,
                 torchType=torchType,
-                variant=variant
+                variant=variant,
+                device_map=device_map
             )
+            
+            print(f"LoadModel: After loading - ltx2_pipeline: {self.ltx2_pipeline}, img2vid: {self.img2vid}, txt2vid: {self.txt2vid}, PipelineType: {self.PipelineType}", file=sys.stderr)
 
             if CLIPSKIP and request.CLIPSkip != 0:
                 self.clip_skip = request.CLIPSkip
@@ -435,7 +608,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
             if request.ControlNet:
                 self.controlnet = ControlNetModel.from_pretrained(
-                    request.ControlNet, torch_dtype=torchType, variant=variant
+                    request.ControlNet, torch_dtype=torchType, variant=variant, device_map=device_map
                 )
                 self.pipe.controlnet = self.controlnet
             else:
@@ -474,7 +647,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
                 self.pipe.set_adapters(adapters_name, adapter_weights=adapters_weights)
 
-            if device != "cpu":
+            # Only move pipeline to device if NOT using device_map
+            # device_map handles device placement automatically
+            if device_map is None and device != "cpu":
                 self.pipe.to(device)
                 if self.controlnet:
                     self.controlnet.to(device)
@@ -585,6 +760,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         # populate kwargs from self.options.
         kwargs.update(self.options)
 
+        kwargs.update(options)
+
         # Set seed
         if request.seed > 0:
             kwargs["generator"] = torch.Generator(device=self.device).manual_seed(
@@ -634,6 +811,51 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 guidance_scale=self.cfg_scale,
                 **kwargs
             ).images[0]
+        elif SD_EMBED and SD_EMBED_AVAILABLE:
+            if self.PipelineType == "StableDiffusionPipeline":
+                (
+                    kwargs["prompt_embeds"],
+                    kwargs["negative_prompt_embeds"],
+                ) = get_weighted_text_embeddings_sd15(
+                    pipe = self.pipe,
+                    prompt = prompt,
+                    neg_prompt = request.negative_prompt if hasattr(request, 'negative_prompt') else None,
+                )
+            if self.PipelineType == "StableDiffusionXLPipeline":
+                (
+                    kwargs["prompt_embeds"],
+                    kwargs["negative_prompt_embeds"],
+                    kwargs["pooled_prompt_embeds"],
+                    kwargs["negative_pooled_prompt_embeds"],
+                ) = get_weighted_text_embeddings_sdxl(
+                    pipe = self.pipe,
+                    prompt = prompt,
+                    neg_prompt = request.negative_prompt if hasattr(request, 'negative_prompt') else None
+                )
+            if self.PipelineType == "StableDiffusion3Pipeline":
+                (
+                    kwargs["prompt_embeds"],
+                    kwargs["negative_prompt_embeds"],
+                    kwargs["pooled_prompt_embeds"],
+                    kwargs["negative_pooled_prompt_embeds"],
+                ) = get_weighted_text_embeddings_sd3(
+                    pipe = self.pipe,
+                    prompt = prompt,
+                    neg_prompt = request.negative_prompt if hasattr(request, 'negative_prompt') else None
+                )
+            if self.PipelineType == "FluxTransformer2DModel":
+                (
+                    kwargs["prompt_embeds"],
+                    kwargs["pooled_prompt_embeds"],
+                ) = get_weighted_text_embeddings_flux1(
+                    pipe = self.pipe,
+                    prompt = prompt,
+                )
+
+            image = self.pipe(
+                guidance_scale=self.cfg_scale,
+                **kwargs
+            ).images[0]
         else:
             # pass the kwargs dictionary to the self.pipe method
             image = self.pipe(
@@ -651,13 +873,19 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         try:
             prompt = request.prompt
             if not prompt:
+                print(f"GenerateVideo: No prompt provided for video generation.", file=sys.stderr)
                 return backend_pb2.Result(success=False, message="No prompt provided for video generation")
+
+            # Debug: Print raw request values
+            print(f"GenerateVideo: Raw request values - num_frames: {request.num_frames}, fps: {request.fps}, cfg_scale: {request.cfg_scale}, step: {request.step}", file=sys.stderr)
 
             # Set default values from request or use defaults
             num_frames = request.num_frames if request.num_frames > 0 else 81
             fps = request.fps if request.fps > 0 else 16
             cfg_scale = request.cfg_scale if request.cfg_scale > 0 else 4.0
             num_inference_steps = request.step if request.step > 0 else 40
+            
+            print(f"GenerateVideo: Using values - num_frames: {num_frames}, fps: {fps}, cfg_scale: {cfg_scale}, num_inference_steps: {num_inference_steps}", file=sys.stderr)
             
             # Prepare generation parameters
             kwargs = {
@@ -684,9 +912,86 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 kwargs["end_image"] = load_image(request.end_image)
 
             print(f"Generating video with {kwargs=}", file=sys.stderr)
+            print(f"GenerateVideo: Pipeline type: {self.PipelineType}, ltx2_pipeline flag: {self.ltx2_pipeline}", file=sys.stderr)
 
             # Generate video frames based on pipeline type
-            if self.PipelineType == "WanPipeline":
+            if self.ltx2_pipeline or self.PipelineType in ["LTX2Pipeline", "LTX2ImageToVideoPipeline"]:
+                # LTX-2 generation with audio (supports both text-to-video and image-to-video)
+                # Determine if this is text-to-video (no image) or image-to-video (has image)
+                has_image = bool(request.start_image)
+                
+                # Remove image-related parameters that might have been added earlier
+                kwargs.pop("start_image", None)
+                kwargs.pop("end_image", None)
+                
+                # LTX2ImageToVideoPipeline uses 'image' parameter for image-to-video
+                # LTX2Pipeline (text-to-video) doesn't need an image parameter
+                if has_image:
+                    # Image-to-video: use 'image' parameter
+                    if self.PipelineType == "LTX2ImageToVideoPipeline":
+                        image = load_image(request.start_image)
+                        kwargs["image"] = image
+                        print(f"LTX-2: Using image-to-video mode with image", file=sys.stderr)
+                    else:
+                        # If pipeline type is LTX2Pipeline but we have an image, we can't do image-to-video
+                        return backend_pb2.Result(success=False, message="LTX2Pipeline does not support image-to-video. Use LTX2ImageToVideoPipeline for image-to-video generation.")
+                else:
+                    # Text-to-video: no image parameter needed
+                    # Ensure no image-related kwargs are present
+                    kwargs.pop("image", None)
+                    print(f"LTX-2: Using text-to-video mode (no image)", file=sys.stderr)
+                
+                # LTX-2 uses 'frame_rate' instead of 'fps'
+                frame_rate = float(fps)
+                kwargs["frame_rate"] = frame_rate
+                
+                # LTX-2 requires output_type="np" and return_dict=False
+                kwargs["output_type"] = "np"
+                kwargs["return_dict"] = False
+                
+                # Generate video and audio
+                print(f"LTX-2: Generating with kwargs: {kwargs}", file=sys.stderr)
+                try:
+                    video, audio = self.pipe(**kwargs)
+                    print(f"LTX-2: Generated video shape: {video.shape}, audio shape: {audio.shape}", file=sys.stderr)
+                except Exception as e:
+                    print(f"LTX-2: Error during pipe() call: {e}", file=sys.stderr)
+                    traceback.print_exc()
+                    return backend_pb2.Result(success=False, message=f"Error generating video with LTX-2 pipeline: {e}")
+                
+                # Convert video to uint8 format
+                video = (video * 255).round().astype("uint8")
+                video = torch.from_numpy(video)
+                
+                print(f"LTX-2: Converting video, shape after conversion: {video.shape}", file=sys.stderr)
+                print(f"LTX-2: Audio sample rate: {self.pipe.vocoder.config.output_sampling_rate}", file=sys.stderr)
+                print(f"LTX-2: Output path: {request.dst}", file=sys.stderr)
+                
+                # Use LTX-2's encode_video function which handles audio
+                try:
+                    ltx2_encode_video(
+                        video[0],
+                        fps=frame_rate,
+                        audio=audio[0].float().cpu(),
+                        audio_sample_rate=self.pipe.vocoder.config.output_sampling_rate,
+                        output_path=request.dst,
+                    )
+                    # Verify file was created and has content
+                    import os
+                    if os.path.exists(request.dst):
+                        file_size = os.path.getsize(request.dst)
+                        print(f"LTX-2: Video file created successfully, size: {file_size} bytes", file=sys.stderr)
+                        if file_size == 0:
+                            return backend_pb2.Result(success=False, message=f"Video file was created but is empty (0 bytes). Check LTX-2 encode_video function.")
+                    else:
+                        return backend_pb2.Result(success=False, message=f"Video file was not created at {request.dst}")
+                except Exception as e:
+                    print(f"LTX-2: Error encoding video: {e}", file=sys.stderr)
+                    traceback.print_exc()
+                    return backend_pb2.Result(success=False, message=f"Error encoding video: {e}")
+                
+                return backend_pb2.Result(message="Video generated successfully", success=True)
+            elif self.PipelineType == "WanPipeline":
                 # WAN2.2 text-to-video generation
                 output = self.pipe(**kwargs)
                 frames = output.frames[0]  # WAN2.2 returns frames in this format
@@ -725,10 +1030,22 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 output = self.pipe(**kwargs)
                 frames = output.frames[0]
             else:
+                print(f"GenerateVideo: Pipeline {self.PipelineType} does not match any known video pipeline handler", file=sys.stderr)
                 return backend_pb2.Result(success=False, message=f"Pipeline {self.PipelineType} does not support video generation")
 
-            # Export video
+            # Export video (for non-LTX-2 pipelines)
+            print(f"GenerateVideo: Exporting video to {request.dst} with fps={fps}", file=sys.stderr)
             export_to_video(frames, request.dst, fps=fps)
+            
+            # Verify file was created
+            import os
+            if os.path.exists(request.dst):
+                file_size = os.path.getsize(request.dst)
+                print(f"GenerateVideo: Video file created, size: {file_size} bytes", file=sys.stderr)
+                if file_size == 0:
+                    return backend_pb2.Result(success=False, message=f"Video file was created but is empty (0 bytes)")
+            else:
+                return backend_pb2.Result(success=False, message=f"Video file was not created at {request.dst}")
             
             return backend_pb2.Result(message="Video generated successfully", success=True)
 
@@ -744,7 +1061,9 @@ def serve(address):
             ('grpc.max_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_send_message_length', 50 * 1024 * 1024),  # 50MB
             ('grpc.max_receive_message_length', 50 * 1024 * 1024),  # 50MB
-        ])
+        ],
+        interceptors=get_auth_interceptors(),
+    )
     backend_pb2_grpc.add_BackendServicer_to_server(BackendServicer(), server)
     server.add_insecure_port(address)
     server.start()

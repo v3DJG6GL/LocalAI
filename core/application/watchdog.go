@@ -1,11 +1,65 @@
 package application
 
 import (
-	"time"
-
+	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
+
+// SyncPinnedModelsToWatchdog reads pinned status from all model configs and updates the watchdog
+func (a *Application) SyncPinnedModelsToWatchdog() {
+	cl := a.ModelConfigLoader()
+	if cl == nil {
+		return
+	}
+	wd := a.modelLoader.GetWatchDog()
+	if wd == nil {
+		return
+	}
+	configs := cl.GetAllModelsConfigs()
+	var pinned []string
+	for _, cfg := range configs {
+		if cfg.IsPinned() {
+			pinned = append(pinned, cfg.Name)
+		}
+	}
+	wd.SetPinnedModels(pinned)
+	xlog.Debug("Synced pinned models to watchdog", "count", len(pinned))
+}
+
+// SyncModelGroupsToWatchdog reads concurrency_groups from all model configs and
+// updates the watchdog so EnforceGroupExclusivity has the current view.
+func (a *Application) SyncModelGroupsToWatchdog() {
+	cl := a.ModelConfigLoader()
+	if cl == nil {
+		return
+	}
+	wd := a.modelLoader.GetWatchDog()
+	if wd == nil {
+		return
+	}
+	groups := extractModelGroupsFromConfigs(cl.GetAllModelsConfigs())
+	wd.ReplaceModelGroups(groups)
+	xlog.Debug("Synced concurrency groups to watchdog", "count", len(groups))
+}
+
+// extractModelGroupsFromConfigs builds the model→groups map the watchdog
+// expects. Disabled models are skipped — their declared groups should not
+// block other models from loading.
+func extractModelGroupsFromConfigs(configs []config.ModelConfig) map[string][]string {
+	out := make(map[string][]string)
+	for _, cfg := range configs {
+		if cfg.IsDisabled() {
+			continue
+		}
+		gs := cfg.GetConcurrencyGroups()
+		if len(gs) == 0 {
+			continue
+		}
+		out[cfg.Name] = gs
+	}
+	return out
+}
 
 func (a *Application) StopWatchdog() error {
 	if a.watchdogStop != nil {
@@ -35,11 +89,20 @@ func (a *Application) startWatchdog() error {
 			model.WithIdleCheck(appConfig.WatchDogIdle),
 			model.WithLRULimit(lruLimit),
 			model.WithMemoryReclaimer(appConfig.MemoryReclaimerEnabled, appConfig.MemoryReclaimerThreshold),
+			model.WithForceEvictionWhenBusy(appConfig.ForceEvictionWhenBusy),
 		)
+
+		// Create new stop channel BEFORE setting up any goroutines
+		// This prevents race conditions where the old shutdown handler might
+		// receive the closed channel and try to shut down the new watchdog
+		a.watchdogStop = make(chan bool, 1)
+
+		// Set the watchdog on the model loader
 		a.modelLoader.SetWatchDog(wd)
 
-		// Create new stop channel
-		a.watchdogStop = make(chan bool, 1)
+		// Sync pinned models and concurrency groups from config to the watchdog
+		a.SyncPinnedModelsToWatchdog()
+		a.SyncModelGroupsToWatchdog()
 
 		// Start watchdog goroutine if any periodic checks are enabled
 		// LRU eviction doesn't need the Run() loop - it's triggered on model load
@@ -48,28 +111,25 @@ func (a *Application) startWatchdog() error {
 			go wd.Run()
 		}
 
-		// Setup shutdown handler
+		// Setup shutdown handler - this goroutine will wait on a.watchdogStop
+		// which is now a fresh channel, so it won't receive any stale signals
+		// Note: We capture wd in a local variable to ensure this handler operates
+		// on the correct watchdog instance (not a later one that gets assigned to wd)
+		wdForShutdown := wd
 		go func() {
 			select {
 			case <-a.watchdogStop:
-				log.Debug().Msg("Watchdog stop signal received")
-				wd.Shutdown()
+				xlog.Debug("Watchdog stop signal received")
+				wdForShutdown.Shutdown()
 			case <-appConfig.Context.Done():
-				log.Debug().Msg("Context canceled, shutting down watchdog")
-				wd.Shutdown()
+				xlog.Debug("Context canceled, shutting down watchdog")
+				wdForShutdown.Shutdown()
 			}
 		}()
 
-		log.Info().
-			Int("lruLimit", lruLimit).
-			Bool("busyCheck", appConfig.WatchDogBusy).
-			Bool("idleCheck", appConfig.WatchDogIdle).
-			Bool("memoryReclaimer", appConfig.MemoryReclaimerEnabled).
-			Float64("memoryThreshold", appConfig.MemoryReclaimerThreshold).
-			Dur("interval", appConfig.WatchDogInterval).
-			Msg("Watchdog started with new settings")
+		xlog.Info("Watchdog started with new settings", "lruLimit", lruLimit, "busyCheck", appConfig.WatchDogBusy, "idleCheck", appConfig.WatchDogIdle, "memoryReclaimer", appConfig.MemoryReclaimerEnabled, "memoryThreshold", appConfig.MemoryReclaimerThreshold, "interval", appConfig.WatchDogInterval)
 	} else {
-		log.Info().Msg("Watchdog disabled")
+		xlog.Info("Watchdog disabled")
 	}
 
 	return nil
@@ -88,20 +148,45 @@ func (a *Application) RestartWatchdog() error {
 	a.watchdogMutex.Lock()
 	defer a.watchdogMutex.Unlock()
 
-	// Shutdown existing watchdog if running
+	// Get the old watchdog before we shut it down
+	oldWD := a.modelLoader.GetWatchDog()
+
+	// Get the state from the old watchdog before shutting it down
+	// This preserves information about loaded models
+	var oldState model.WatchDogState
+	if oldWD != nil {
+		oldState = oldWD.GetState()
+	}
+
+	// Signal all handlers to stop by closing the stop channel
+	// This will cause any goroutine waiting on <-a.watchdogStop to unblock
 	if a.watchdogStop != nil {
 		close(a.watchdogStop)
 		a.watchdogStop = nil
 	}
 
-	// Shutdown existing watchdog if running
-	currentWD := a.modelLoader.GetWatchDog()
-	if currentWD != nil {
-		currentWD.Shutdown()
-		// Wait a bit for shutdown to complete
-		time.Sleep(100 * time.Millisecond)
+	// Shutdown existing watchdog - this triggers the stop signal
+	if oldWD != nil {
+		oldWD.Shutdown()
+		// Wait for the old watchdog's Run() goroutine to fully shut down
+		oldWD.WaitDone()
 	}
 
 	// Start watchdog with new settings
-	return a.startWatchdog()
+	if err := a.startWatchdog(); err != nil {
+		return err
+	}
+
+	// Restore the model state from the old watchdog to the new one
+	// This ensures the new watchdog knows about already-loaded models
+	newWD := a.modelLoader.GetWatchDog()
+	if newWD != nil && len(oldState.AddressModelMap) > 0 {
+		newWD.RestoreState(oldState)
+	}
+
+	// Re-sync pinned models and concurrency groups after restart
+	a.SyncPinnedModelsToWatchdog()
+	a.SyncModelGroupsToWatchdog()
+
+	return nil
 }

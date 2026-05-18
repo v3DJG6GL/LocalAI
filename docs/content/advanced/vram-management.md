@@ -8,7 +8,8 @@ url = '/advanced/vram-management'
 When running multiple models in LocalAI, especially on systems with limited GPU memory (VRAM), you may encounter situations where loading a new model fails because there isn't enough available VRAM. LocalAI provides several mechanisms to automatically manage model memory allocation and prevent VRAM exhaustion:
 
 1. **Max Active Backends (LRU Eviction)**: Limit the number of loaded models, evicting the least recently used when the limit is reached
-2. **Watchdog Mechanisms**: Automatically unload idle or stuck models based on configurable timeouts
+2. **Concurrency Groups**: Per-model anti-affinity rules that prevent specific models from coexisting on the same node
+3. **Watchdog Mechanisms**: Automatically unload idle or stuck models based on configurable timeouts
 
 ## The Problem
 
@@ -52,6 +53,49 @@ Setting the limit to `1` is equivalent to single active backend mode (see below)
 3. The LRU model(s) are automatically unloaded to make room for the new model
 4. Concurrent requests for loading different models are handled safely - the system accounts for models currently being loaded when calculating evictions
 
+### Eviction Behavior with Active Requests
+
+By default, LocalAI will **skip evicting models that have active API calls** to prevent interrupting ongoing requests. This means:
+
+- If all models are busy (have active requests), eviction will be skipped and the system will wait for models to become idle
+- The loading request will retry eviction with configurable retry settings
+- This ensures data integrity and prevents request failures
+
+You can configure this behavior via WebUI or using the following settings:
+
+#### Force Eviction When Busy
+
+To allow evicting models even when they have active API calls (not recommended for production):
+
+```bash
+# Via CLI
+./local-ai --force-eviction-when-busy
+
+# Via environment variable
+LOCALAI_FORCE_EVICTION_WHEN_BUSY=true ./local-ai
+```
+
+> **Warning:** Enabling force eviction can interrupt active requests and cause errors. Only use this if you understand the implications.
+
+#### LRU Eviction Retry Settings
+
+When models are busy and cannot be evicted, LocalAI will retry eviction with configurable settings:
+
+```bash
+# Configure maximum retries (default: 30)
+./local-ai --lru-eviction-max-retries=50
+
+# Configure retry interval (default: 1s)
+./local-ai --lru-eviction-retry-interval=2s
+
+# Using environment variables
+LOCALAI_LRU_EVICTION_MAX_RETRIES=50 \
+LOCALAI_LRU_EVICTION_RETRY_INTERVAL=2s \
+./local-ai
+```
+
+These settings control how long the system will wait for busy models to become idle before giving up. The retry mechanism allows busy models to complete their requests before being evicted, preventing request failures.
+
 ### Example
 
 ```bash
@@ -92,6 +136,86 @@ LOCALAI_SINGLE_ACTIVE_BACKEND=true ./local-ai
 - Single GPU systems with very limited VRAM
 - When you only need one model active at a time
 - Simple deployments where model switching is acceptable
+
+## Solution 1b: Concurrency Groups (per-model anti-affinity)
+
+`--max-active-backends` is a global count — three loaded models is fine, but it
+doesn't know that two of them are 120B and shouldn't share a GPU.
+**Concurrency groups** give per-model rules: any two models that share a group
+name are mutually exclusive on the same node. Loading one evicts the others.
+Models with no groups behave exactly as before.
+
+This addresses [issue #9659](https://github.com/mudler/LocalAI/issues/9659):
+
+> allow my zed prediction model to run alongside anything but don't allow my
+> two 120b models to run alongside each other
+
+### Configuration
+
+Declare groups per model in the YAML config — no CLI flag, no env var:
+
+```yaml
+# llama-120b-a.yaml
+name: llama-120b-a
+backend: llama-cpp
+parameters:
+  model: llama-120b-a.gguf
+concurrency_groups: ["vram-heavy"]
+```
+
+```yaml
+# llama-120b-b.yaml
+name: llama-120b-b
+backend: llama-cpp
+parameters:
+  model: llama-120b-b.gguf
+concurrency_groups: ["vram-heavy"]
+```
+
+```yaml
+# zed-predict.yaml — no groups, runs alongside anything
+name: zed-predict
+backend: llama-cpp
+parameters:
+  model: zed-predict.gguf
+```
+
+With this configuration:
+
+1. Request `zed-predict` → loads.
+2. Request `llama-120b-a` → loads alongside `zed-predict`.
+3. Request `llama-120b-b` → `llama-120b-a` is evicted (shared group
+   `vram-heavy`); `zed-predict` stays loaded.
+
+A model can declare multiple groups; two models conflict if they share **any**
+group name. Group names are arbitrary strings — pick names that make sense for
+your hardware (`vram-heavy`, `gpu-1`, `large-context`, ...).
+
+### Interaction with other knobs
+
+- **`--max-active-backends`**: groups are checked *before* the LRU cap. Group
+  evictions may already make room; LRU then enforces the global count.
+- **`pinned: true`**: a pinned model is never evicted, including by a group
+  conflict. The new request is loaded with a warning logged — pinning two
+  models in the same group is a configuration mismatch.
+- **`--force-eviction-when-busy`**: same retry semantics as LRU. A busy
+  conflict is skipped and retried (`--lru-eviction-max-retries`,
+  `--lru-eviction-retry-interval`); after retries exhaust, the load proceeds
+  with a warning.
+
+### Distributed mode
+
+`concurrency_groups` is enforced **per node**, not cluster-wide — VRAM is a
+node-local resource, so two heavy models on different nodes is fine. The
+distributed scheduler additionally uses the rule as a placement hint: when
+choosing where to load a new model, it prefers nodes that don't already host a
+same-group model, falling back to eviction only if every candidate has a
+conflict.
+
+`concurrency_groups` composes with `NodeSelector` (which decides *which
+nodes* a model is eligible for) — the two filters apply in sequence. Use
+`NodeSelector` to target hardware classes; use `concurrency_groups` to keep
+specific models from co-residing on whichever node hosts them.
 
 ## Solution 2: Watchdog Mechanisms
 
@@ -206,6 +330,33 @@ This configuration:
 - Ensures no more than 3 models are loaded at once (LRU eviction kicks in when exceeded)
 - Automatically unloads any model that hasn't been used for 15 minutes
 - Provides both hard limits and time-based cleanup
+
+### Example with Retry Settings
+
+You can also configure retry behavior when models are busy:
+
+```bash
+# Allow up to 2 active backends with custom retry settings
+LOCALAI_MAX_ACTIVE_BACKENDS=2 \
+LOCALAI_LRU_EVICTION_MAX_RETRIES=50 \
+LOCALAI_LRU_EVICTION_RETRY_INTERVAL=2s \
+./local-ai
+```
+
+Or using command line flags:
+
+```bash
+./local-ai \
+  --max-active-backends=2 \
+  --lru-eviction-max-retries=50 \
+  --lru-eviction-retry-interval=2s
+```
+
+This configuration:
+- Limits to 2 active backends
+- Will retry eviction up to 50 times if models are busy
+- Waits 2 seconds between retry attempts
+- Ensures busy models have time to complete their requests before eviction
 
 ## Limitations and Considerations
 

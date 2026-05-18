@@ -10,11 +10,12 @@ import (
 	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // JINARerankEndpoint acts like the Jina reranker endpoint (https://jina.ai/reranker/)
 // @Summary Reranks a list of phrases by relevance to a given text query.
+// @Tags rerank
 // @Param request body schema.JINARerankRequest true "query params"
 // @Success 200 {object} schema.JINARerankResponse "Response"
 // @Router /v1/rerank [post]
@@ -31,7 +32,7 @@ func JINARerankEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, app
 			return echo.ErrBadRequest
 		}
 
-		log.Debug().Str("model", input.Model).Msg("JINA Rerank Request received")
+		xlog.Debug("JINA Rerank Request received", "model", input.Model)
 		var requestTopN int32
 		docs := int32(len(input.Documents))
 		if input.TopN == nil { // omit top_n to get all
@@ -51,7 +52,7 @@ func JINARerankEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, app
 			Documents: input.Documents,
 		}
 
-		results, err := backend.Rerank(request, ml, appConfig, *cfg)
+		results, err := backend.Rerank(c.Request().Context(), request, ml, appConfig, *cfg)
 		if err != nil {
 			return err
 		}

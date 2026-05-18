@@ -1,7 +1,7 @@
 
 +++
 disableToc = false
-title = "📖 Text generation (GPT)"
+title = "Text Generation (GPT)"
 weight = 10
 url = "/features/text-generation/"
 +++
@@ -70,6 +70,359 @@ You can list all the models available with:
 
 ```bash
 curl http://localhost:8080/v1/models
+```
+
+### Anthropic Messages API
+
+LocalAI supports the Anthropic Messages API, which is compatible with Claude clients. This endpoint provides a structured way to send messages and receive responses, with support for tools, streaming, and multimodal content.
+
+**Endpoint:** `POST /v1/messages` or `POST /messages`
+
+**Reference:** https://docs.anthropic.com/claude/reference/messages_post
+
+#### Basic Usage
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "max_tokens": 1024,
+    "messages": [
+      {"role": "user", "content": "Say this is a test!"}
+    ]
+  }'
+```
+
+#### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `model` | string | Yes | The model identifier |
+| `messages` | array | Yes | Array of message objects with `role` and `content` |
+| `max_tokens` | integer | Yes | Maximum number of tokens to generate (must be > 0) |
+| `system` | string | No | System message to set the assistant's behavior |
+| `temperature` | float | No | Sampling temperature (0.0 to 1.0) |
+| `top_p` | float | No | Nucleus sampling parameter |
+| `top_k` | integer | No | Top-k sampling parameter |
+| `stop_sequences` | array | No | Array of strings that will stop generation |
+| `stream` | boolean | No | Enable streaming responses |
+| `tools` | array | No | Array of tool definitions for function calling |
+| `tool_choice` | string/object | No | Tool choice strategy: "auto", "any", "none", or specific tool |
+| `metadata` | object | No | Per-request metadata passed to the backend (e.g., `{"enable_thinking": "true"}`) |
+
+#### Message Format
+
+Messages can contain text or structured content blocks:
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "max_tokens": 1024,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is in this image?"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/jpeg",
+              "data": "base64_encoded_image_data"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+#### Tool Calling
+
+The Anthropic API supports function calling through tools:
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "max_tokens": 1024,
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "The city and state"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "messages": [
+      {"role": "user", "content": "What is the weather in San Francisco?"}
+    ]
+  }'
+```
+
+#### Streaming
+
+Enable streaming responses by setting `stream: true`:
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "Tell me a story"}
+    ]
+  }'
+```
+
+Streaming responses use Server-Sent Events (SSE) format with event types: `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`.
+
+#### Response Format
+
+```json
+{
+  "id": "msg_abc123",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "This is a test!"
+    }
+  ],
+  "model": "ggml-koala-7b-model-q4_0-r2.bin",
+  "stop_reason": "end_turn",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5
+  }
+}
+```
+
+### Open Responses API
+
+LocalAI supports the Open Responses API specification, which provides a standardized interface for AI model interactions with support for background processing, streaming, tool calling, and advanced features like reasoning.
+
+**Endpoint:** `POST /v1/responses` or `POST /responses`
+
+**Reference:** https://www.openresponses.org/specification
+
+#### Basic Usage
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "input": "Say this is a test!",
+    "max_output_tokens": 1024
+  }'
+```
+
+#### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `model` | string | Yes | The model identifier |
+| `input` | string/array | Yes | Input text or array of input items |
+| `max_output_tokens` | integer | No | Maximum number of tokens to generate |
+| `temperature` | float | No | Sampling temperature |
+| `top_p` | float | No | Nucleus sampling parameter |
+| `instructions` | string | No | System instructions |
+| `tools` | array | No | Array of tool definitions |
+| `tool_choice` | string/object | No | Tool choice: "auto", "required", "none", or specific tool |
+| `stream` | boolean | No | Enable streaming responses |
+| `background` | boolean | No | Run request in background (returns immediately) |
+| `store` | boolean | No | Whether to store the response |
+| `reasoning` | object | No | Reasoning configuration with `effort` and `summary` |
+| `parallel_tool_calls` | boolean | No | Allow parallel tool calls |
+| `max_tool_calls` | integer | No | Maximum number of tool calls |
+| `presence_penalty` | float | No | Presence penalty (-2.0 to 2.0) |
+| `frequency_penalty` | float | No | Frequency penalty (-2.0 to 2.0) |
+| `top_logprobs` | integer | No | Number of top logprobs to return |
+| `truncation` | string | No | Truncation mode: "auto" or "disabled" |
+| `text_format` | object | No | Text format configuration |
+| `metadata` | object | No | Custom metadata |
+
+#### Input Format
+
+Input can be a simple string or an array of structured items:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": "What is the weather?"
+      }
+    ],
+    "max_output_tokens": 1024
+  }'
+```
+
+#### Background Processing
+
+Run requests in the background for long-running tasks:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "input": "Generate a long story",
+    "max_output_tokens": 4096,
+    "background": true
+  }'
+```
+
+The response will include a response ID that can be used to poll for completion:
+
+```json
+{
+  "id": "resp_abc123",
+  "object": "response",
+  "status": "in_progress",
+  "created_at": 1234567890
+}
+```
+
+#### Retrieving Background Responses
+
+Use the GET endpoint to retrieve background responses:
+
+```bash
+# Get response by ID
+curl http://localhost:8080/v1/responses/resp_abc123
+
+# Resume streaming with query parameters
+curl "http://localhost:8080/v1/responses/resp_abc123?stream=true&starting_after=10"
+```
+
+#### Canceling Background Responses
+
+Cancel a background response that's still in progress:
+
+```bash
+curl -X POST http://localhost:8080/v1/responses/resp_abc123/cancel
+```
+
+#### Tool Calling
+
+Open Responses API supports function calling with tools:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "input": "What is the weather in San Francisco?",
+    "tools": [
+      {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get the current weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "The city and state"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_output_tokens": 1024
+  }'
+```
+
+#### Reasoning Configuration
+
+Configure reasoning effort and summary style:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "ggml-koala-7b-model-q4_0-r2.bin",
+    "input": "Solve this complex problem step by step",
+    "reasoning": {
+      "effort": "high",
+      "summary": "detailed"
+    },
+    "max_output_tokens": 2048
+  }'
+```
+
+#### Response Format
+
+```json
+{
+  "id": "resp_abc123",
+  "object": "response",
+  "created_at": 1234567890,
+  "completed_at": 1234567895,
+  "status": "completed",
+  "model": "ggml-koala-7b-model-q4_0-r2.bin",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_001",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "This is a test!",
+          "annotations": [],
+          "logprobs": []
+        }
+      ],
+      "status": "completed"
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "temperature": 0.7,
+  "top_p": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "total_tokens": 15,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  }
+}
 ```
 
 ## Backends
@@ -161,6 +514,7 @@ The `llama.cpp` backend supports additional configuration options that can be sp
 | `no_op_offload` | boolean | Disable offloading host tensor operations to device. Default: `false`. | `no_op_offload:true` |
 | `kv_unified` or `unified_kv` | boolean | Enable unified KV cache. Default: `false`. | `kv_unified:true` |
 | `n_ctx_checkpoints` or `ctx_checkpoints` | integer | Maximum number of context checkpoints per slot. Default: `8`. | `ctx_checkpoints:4` |
+| `split_mode` or `sm` | string | How to split the model across multiple GPUs: `none` (single GPU only), `layer` (default — split layers and KV across GPUs), `row` (split rows across GPUs), `tensor` (experimental tensor parallelism — requires `flash_attention: true`, no KV-cache quantization, manually set `context_size`, and a llama.cpp build that includes [#19378](https://github.com/ggml-org/llama.cpp/pull/19378)). | `split_mode:tensor` |
 
 **Example configuration with options:**
 
@@ -186,35 +540,97 @@ options:
 - [llama](https://github.com/ggerganov/llama.cpp)
 
 
-### exllama/2
+### ik_llama.cpp
 
-[Exllama](https://github.com/turboderp/exllama) is a "A more memory-efficient rewrite of the HF transformers implementation of Llama for use with quantized weights". Both `exllama` and `exllama2` are supported.
+[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) is a hard fork of `llama.cpp` by Iwan Kawrakow that focuses on superior CPU and hybrid GPU/CPU performance. It ships additional quantization types (IQK quants), custom quantization mixes, Multi-head Latent Attention (MLA) for DeepSeek models, and fine-grained tensor offload controls — particularly useful for running very large models on commodity CPU hardware.
 
-#### Model setup
+{{% notice note %}}
 
-Download the model as a folder inside the `model ` directory and create a YAML file specifying the `exllama` backend. For instance with the `TheBloke/WizardLM-7B-uncensored-GPTQ` model:
+The `ik-llama-cpp` backend requires a CPU with **AVX2** support. The IQK kernels are not compatible with older CPUs.
 
-```
-$ git lfs install
-$ cd models && git clone https://huggingface.co/TheBloke/WizardLM-7B-uncensored-GPTQ
-$ ls models/                                                                 
-.keep                        WizardLM-7B-uncensored-GPTQ/ exllama.yaml
-$ cat models/exllama.yaml                                                     
-name: exllama
+{{% /notice %}}
+
+#### Features
+
+The `ik-llama-cpp` backend supports the following features:
+- [📖 Text generation (GPT)]({{%relref "features/text-generation" %}})
+- [🧠 Embeddings]({{%relref "features/embeddings" %}})
+- IQK quantization types for better CPU inference performance
+- Multimodal models (via clip/llava)
+
+#### Setup
+
+The backend is distributed as a separate container image and can be installed from the LocalAI backend gallery, or specified directly in a model configuration. GGUF models loaded with this backend benefit from ik_llama.cpp's optimized CPU kernels — especially useful for MoE models and large quantized models that would otherwise be GPU-bound.
+
+#### YAML configuration
+
+To use the `ik-llama-cpp` backend, specify it as the backend in the YAML file:
+
+```yaml
+name: my-model
+backend: ik-llama-cpp
 parameters:
-  model: WizardLM-7B-uncensored-GPTQ
-backend: exllama
+  # Relative to the models path
+  model: file.gguf
 ```
 
-Test with:
+The aliases `ik-llama` and `ik_llama` are also accepted.
+
+#### Reference
+
+- [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)
+
+
+### turboquant (llama.cpp fork with TurboQuant KV-cache)
+
+[llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) is a `llama.cpp` fork that adds the **TurboQuant KV-cache** quantization scheme. It reuses the upstream `llama.cpp` codebase and ships as a drop-in alternative backend inside LocalAI, sharing the same gRPC server sources as the stock `llama-cpp` backend — so any GGUF model that runs on `llama-cpp` also runs on `turboquant`.
+
+You would pick `turboquant` when you want **smaller KV-cache memory pressure** (longer contexts on the same VRAM) or to experiment with the fork's quantized KV representations on top of the standard `cache_type_k` / `cache_type_v` knobs already supported by upstream `llama.cpp`.
+
+#### Features
+
+- Drop-in GGUF compatibility with upstream `llama.cpp`.
+- TurboQuant KV-cache quantization (see fork README for the current set of accepted `cache_type_k` / `cache_type_v` values).
+- Same feature surface as the `llama-cpp` backend: text generation, embeddings, tool calls, multimodal via mmproj.
+- Available on CPU (AVX/AVX2/AVX512/fallback), NVIDIA CUDA 12/13, AMD ROCm/HIP, Intel SYCL f32/f16, Vulkan, and NVIDIA L4T.
+
+#### Setup
+
+`turboquant` ships as a separate container image in the LocalAI backend gallery. Install it like any other backend:
 
 ```bash
-curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{                                                                                                         
-   "model": "exllama",
-   "messages": [{"role": "user", "content": "How are you?"}],
-   "temperature": 0.1
- }'
+local-ai backends install turboquant
 ```
+
+Or pick a specific flavor for your hardware (example tags: `cpu-turboquant`, `cuda12-turboquant`, `cuda13-turboquant`, `rocm-turboquant`, `intel-sycl-f16-turboquant`, `vulkan-turboquant`).
+
+#### YAML configuration
+
+To run a model with `turboquant`, set the backend in your model YAML and optionally pick quantized KV-cache types:
+
+```yaml
+name: my-model
+backend: turboquant
+parameters:
+  # Relative to the models path
+  model: file.gguf
+# Use TurboQuant's own KV-cache quantization schemes. The fork accepts
+# the standard llama.cpp types (f16, f32, q8_0, q4_0, q4_1, q5_0, q5_1)
+# and adds three TurboQuant-specific ones: turbo2, turbo3, turbo4.
+# turbo3 / turbo4 auto-enable flash_attention (required for turbo K/V)
+# and offer progressively more aggressive compression.
+cache_type_k: turbo3
+cache_type_v: turbo3
+context_size: 8192
+```
+
+The `cache_type_k` / `cache_type_v` fields map to llama.cpp's `-ctk` / `-ctv` flags. The stock `llama-cpp` backend only accepts the standard llama.cpp types — to use `turbo2` / `turbo3` / `turbo4` you need this `turboquant` backend, which is where the fork's TurboQuant code paths actually take effect. Pick `q8_0` here and you're just running stock llama.cpp KV quantization; pick `turbo*` and you're running TurboQuant.
+
+#### Reference
+
+- [llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant)
+- [Tracked branch: `feature/turboquant-kv-cache`](https://github.com/TheTom/llama-cpp-turboquant/tree/feature/turboquant-kv-cache)
+
 
 ### vLLM
 
@@ -248,6 +664,177 @@ curl http://localhost:8080/v1/completions -H "Content-Type: application/json" -d
    "temperature": 0.1, "top_p": 0.1
  }'
 ```
+
+#### Passing arbitrary vLLM options with `engine_args`
+
+A subset of `AsyncEngineArgs` is exposed as typed YAML fields
+(`tensor_parallel_size`, `gpu_memory_utilization`, `quantization`,
+`max_model_len`, `dtype`, `trust_remote_code`, `enforce_eager`, …).
+Anything else can be passed through the generic `engine_args:` map.
+Keys are forwarded verbatim to vLLM's engine; unknown keys fail at load
+time with the closest valid name as a hint. Nested maps materialise
+into vLLM's nested config dataclasses (`SpeculativeConfig`,
+`KVTransferConfig`, `CompilationConfig`, …).
+
+Speculative decoding (DFlash, ngram, eagle, deepseek_mtp, …) is
+configured this way:
+
+```yaml
+name: qwen3.5-4b-dflash
+backend: vllm
+parameters:
+  model: Qwen/Qwen3.5-4B
+context_size: 8192
+max_model_len: 8192
+trust_remote_code: true
+quantization: fp8
+template:
+  use_tokenizer_template: true
+engine_args:
+  speculative_config:
+    method: dflash
+    model: z-lab/Qwen3.5-4B-DFlash
+    num_speculative_tokens: 15
+```
+
+The shape of `speculative_config` follows vLLM's
+[`SpeculativeConfig`](https://docs.vllm.ai/en/latest/api/vllm/config/speculative.html)
+— `method` picks the algorithm, the remaining keys are method-specific.
+Drafters from [z-lab](https://huggingface.co/z-lab) are paired with
+specific target models; pick the one that matches your target. The
+drafter loads in its native precision regardless of the target's
+`quantization:` setting.
+
+Another example — picking a non-default attention backend (e.g. on
+hardware where the default cutlass kernels aren't supported):
+
+```yaml
+engine_args:
+  attention_backend: TRITON_ATTN
+```
+
+#### Multi-node data parallelism
+
+`engine_args.data_parallel_size > 1` combined with the
+`local-ai p2p-worker vllm` follower lets a single model span multiple
+GPU nodes. See [vLLM Multi-Node (Data-Parallel)]({{% relref
+"features/distributed-mode#vllm-multi-node-data-parallel" %}})
+for the head/follower configuration and a worked Kimi-K2.6 example.
+
+### SGLang
+
+[SGLang](https://github.com/sgl-project/sglang) is a fast serving
+framework for LLMs and VLMs with a focus on prefix caching, speculative
+decoding, and multi-modal generation. LocalAI ships a gRPC backend that
+wraps SGLang's async `Engine`, including its native function-call and
+reasoning parsers.
+
+#### Setup
+
+```yaml
+name: sglang
+backend: sglang
+parameters:
+  model: "Qwen/Qwen3-4B"
+template:
+  use_tokenizer_template: true
+```
+
+The backend will pull the model from HuggingFace on first load.
+
+#### Passing arbitrary SGLang options with `engine_args`
+
+The same `engine_args:` map that the vLLM backend accepts is also
+honoured by the SGLang backend. Keys are validated against
+[`ServerArgs`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py)
+— SGLang's central configuration dataclass — and forwarded verbatim to
+`Engine(**kwargs)`. Unknown keys fail at load time with the closest
+valid name as a hint. Unlike vLLM, `ServerArgs` is flat: speculative
+decoding fields are top-level (`speculative_algorithm`,
+`speculative_draft_model_path`, etc.) rather than nested under a
+`speculative_config:` dict.
+
+The typed YAML fields shared with vLLM are mapped to their SGLang
+equivalents (`gpu_memory_utilization` → `mem_fraction_static`,
+`enforce_eager` → `disable_cuda_graph`, `tensor_parallel_size` →
+`tp_size`, `max_model_len` → `context_length`). Anything else,
+including all speculative-decoding flags, goes under `engine_args:`.
+
+##### Speculative decoding: Gemma 4 with Multi-Token Prediction
+
+Google publishes paired "assistant" drafters for every Gemma 4 size.
+The drafters use Multi-Token Prediction (MTP) to propose several
+candidate tokens per target step, which SGLang then verifies in
+parallel. Flags below are transcribed verbatim from the
+[SGLang Gemma 4 cookbook](https://docs.sglang.io/cookbook/autoregressive/Google/Gemma4#speculative-decoding-mtp-server-commands).
+
+For consumer GPUs in the 16–24 GB range, use **E4B** (8 B total /
+4 B effective parameters):
+
+```yaml
+name: gemma-4-e4b-mtp
+backend: sglang
+parameters:
+  model: google/gemma-4-E4B-it
+context_size: 4096
+template:
+  use_tokenizer_template: true
+options:
+  - tool_parser:gemma4
+  - reasoning_parser:gemma4
+engine_args:
+  mem_fraction_static: 0.85
+  speculative_algorithm: NEXTN
+  speculative_draft_model_path: google/gemma-4-E4B-it-assistant
+  speculative_num_steps: 5
+  speculative_num_draft_tokens: 6
+  speculative_eagle_topk: 1
+```
+
+For smaller cards (8–12 GB), drop to **E2B** (5 B total / 2 B effective)
+by swapping the model paths to `google/gemma-4-E2B-it` and
+`google/gemma-4-E2B-it-assistant`; the rest of the flags stay the same.
+
+`NEXTN` is normalised to `EAGLE` inside `ServerArgs.__post_init__`, so
+either value works — the cookbook uses `NEXTN`. `mem_fraction_static`
+is the share of GPU memory SGLang reserves for the model + KV pool;
+0.85 is the cookbook's default and adapts to whatever single GPU the
+backend is running on.
+
+The 31 B dense and 26 B-A4B MoE Gemma 4 variants exist in the same
+cookbook but require `--tp-size 2`, so they're not in the gallery as
+single-GPU recipes.
+
+> **SGLang version requirement.** Gemma 4 support landed in SGLang via
+> [PR #21952](https://github.com/sgl-project/sglang/pull/21952). The
+> LocalAI sglang backend pins a release that includes it; if you've
+> overridden the pin to an older version, this recipe will fail with a
+> "model architecture not recognised" error at load time.
+
+##### Other speculative algorithms
+
+`speculative_algorithm:` also accepts `EAGLE`/`EAGLE3` (paired with an
+EAGLE-style draft head), `DFLASH` (block-diffusion drafters from
+[z-lab](https://huggingface.co/z-lab) for the Qwen3 family), `STANDALONE`
+(a smaller draft LLM verifying a larger target), and `NGRAM` (no draft
+model — pure prefix-history speculation). See SGLang's
+[speculative-decoding docs](https://docs.sglang.io/advanced_features/speculative_decoding.html)
+for the full algorithm matrix.
+
+#### Tool calling and reasoning parsers
+
+SGLang's native parsers stream `tool_calls` and `reasoning_content`
+inside `ChatDelta` — the LocalAI Python backend wires them up
+per-request rather than via `engine_args:`. Pick a parser by name:
+
+```yaml
+options:
+  - tool_parser:hermes
+  - reasoning_parser:deepseek_r1
+```
+
+The full list of registered parsers lives in `sglang.srt.function_call`
+and `sglang.srt.parser.reasoning_parser`.
 
 ### Transformers
 

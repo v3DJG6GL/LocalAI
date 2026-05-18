@@ -8,7 +8,7 @@ JOBS?=$(shell nproc --ignore=1)
 
 # stablediffusion.cpp (ggml)
 STABLEDIFFUSION_GGML_REPO?=https://github.com/leejet/stable-diffusion.cpp
-STABLEDIFFUSION_GGML_VERSION?=200cb6f2ca07e40fa83b610a4e595f4da06ec709
+STABLEDIFFUSION_GGML_VERSION?=bd17f53b7386fb5f60e8587b75e73c4b2fed3426
 
 CMAKE_ARGS+=-DGGML_MAX_NAME=128
 
@@ -28,7 +28,12 @@ else ifeq ($(BUILD_TYPE),clblas)
 	CMAKE_ARGS+=-DGGML_CLBLAST=ON -DCLBlast_DIR=/some/path
 # If it's hipblas we do have also to set CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++
 else ifeq ($(BUILD_TYPE),hipblas)
-	CMAKE_ARGS+=-DSD_HIPBLAS=ON -DGGML_HIPBLAS=ON
+	ROCM_HOME ?= /opt/rocm
+	ROCM_PATH ?= /opt/rocm
+	export CXX=$(ROCM_HOME)/llvm/bin/clang++
+	export CC=$(ROCM_HOME)/llvm/bin/clang
+	AMDGPU_TARGETS?=gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+	CMAKE_ARGS+=-DSD_HIPBLAS=ON -DGGML_HIPBLAS=ON -DAMDGPU_TARGETS=$(AMDGPU_TARGETS)
 else ifeq ($(BUILD_TYPE),vulkan)
 	CMAKE_ARGS+=-DSD_VULKAN=ON -DGGML_VULKAN=ON
 else ifeq ($(OS),Darwin)
@@ -61,15 +66,18 @@ sources/stablediffusion-ggml.cpp:
 	git checkout $(STABLEDIFFUSION_GGML_VERSION) && \
 	git submodule update --init --recursive --depth 1 --single-branch
 
-libgosd.so: sources/stablediffusion-ggml.cpp CMakeLists.txt gosd.cpp gosd.h
-	mkdir -p build && \
-	cd build && \
-	cmake .. $(CMAKE_ARGS) && \
-	cmake --build . --config Release -j$(JOBS) && \
-	cd .. && \
-	mv build/libgosd.so ./
+# Detect OS
+UNAME_S := $(shell uname -s)
 
-stablediffusion-ggml: main.go gosd.go libgosd.so
+# Only build CPU variants on Linux
+ifeq ($(UNAME_S),Linux)
+	VARIANT_TARGETS = libgosd-avx.so libgosd-avx2.so libgosd-avx512.so libgosd-fallback.so
+else
+	# On non-Linux (e.g., Darwin), build only fallback variant
+	VARIANT_TARGETS = libgosd-fallback.so
+endif
+
+stablediffusion-ggml: main.go gosd.go $(VARIANT_TARGETS)
 	CGO_ENABLED=0 $(GOCMD) build -tags "$(GO_TAGS)" -o stablediffusion-ggml ./
 
 package: stablediffusion-ggml
@@ -77,5 +85,46 @@ package: stablediffusion-ggml
 
 build: package
 
-clean:
-	rm -rf libgosd.so build stablediffusion-ggml package sources
+clean: purge
+	rm -rf libgosd*.so stablediffusion-ggml package sources
+
+purge:
+	rm -rf build*
+
+# Build all variants (Linux only)
+ifeq ($(UNAME_S),Linux)
+libgosd-avx.so: sources/stablediffusion-ggml.cpp
+	$(MAKE) purge
+	$(info ${GREEN}I stablediffusion-ggml build info:avx${RESET})
+	SO_TARGET=libgosd-avx.so CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" $(MAKE) libgosd-custom
+	rm -rfv build*
+
+libgosd-avx2.so: sources/stablediffusion-ggml.cpp
+	$(MAKE) purge
+	$(info ${GREEN}I stablediffusion-ggml build info:avx2${RESET})
+	SO_TARGET=libgosd-avx2.so CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=on -DGGML_AVX512=off -DGGML_FMA=on -DGGML_F16C=on -DGGML_BMI2=on" $(MAKE) libgosd-custom
+	rm -rfv build*
+
+libgosd-avx512.so: sources/stablediffusion-ggml.cpp
+	$(MAKE) purge
+	$(info ${GREEN}I stablediffusion-ggml build info:avx512${RESET})
+	SO_TARGET=libgosd-avx512.so CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=on -DGGML_AVX512=on -DGGML_FMA=on -DGGML_F16C=on -DGGML_BMI2=on" $(MAKE) libgosd-custom
+	rm -rfv build*
+endif
+
+# Build fallback variant (all platforms)
+libgosd-fallback.so: sources/stablediffusion-ggml.cpp
+	$(MAKE) purge
+	$(info ${GREEN}I stablediffusion-ggml build info:fallback${RESET})
+	SO_TARGET=libgosd-fallback.so CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" $(MAKE) libgosd-custom
+	rm -rfv build*
+
+libgosd-custom: CMakeLists.txt cpp/gosd.cpp cpp/gosd.h
+	mkdir -p build-$(SO_TARGET) && \
+	cd build-$(SO_TARGET) && \
+	cmake .. $(CMAKE_ARGS) && \
+	cmake --build . --config Release -j$(JOBS) && \
+	cd .. && \
+	mv build-$(SO_TARGET)/libgosd.so ./$(SO_TARGET)
+
+all: stablediffusion-ggml package

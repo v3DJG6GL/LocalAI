@@ -11,9 +11,10 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/application"
 	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/http/endpoints/openresponses"
 	"github.com/mudler/LocalAI/core/p2p"
 	"github.com/mudler/LocalAI/core/schema"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // GetSettingsEndpoint returns current settings with precedence (env > file > defaults)
@@ -76,6 +77,30 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 				})
 			}
 		}
+		if settings.LRUEvictionRetryInterval != nil {
+			if _, err := time.ParseDuration(*settings.LRUEvictionRetryInterval); err != nil {
+				return c.JSON(http.StatusBadRequest, schema.SettingsResponse{
+					Success: false,
+					Error:   "Invalid lru_eviction_retry_interval format: " + err.Error(),
+				})
+			}
+		}
+		if settings.OpenResponsesStoreTTL != nil {
+			if *settings.OpenResponsesStoreTTL != "0" && *settings.OpenResponsesStoreTTL != "" {
+				if _, err := time.ParseDuration(*settings.OpenResponsesStoreTTL); err != nil {
+					return c.JSON(http.StatusBadRequest, schema.SettingsResponse{
+						Success: false,
+						Error:   "Invalid open_responses_store_ttl format: " + err.Error(),
+					})
+				}
+			}
+		}
+
+		// Generate P2P token before saving so the real token is persisted (not "0")
+		if settings.P2PToken != nil && *settings.P2PToken == "0" {
+			token := p2p.GenerateToken(60, 60)
+			settings.P2PToken = &token
+		}
 
 		// Save to file
 		if appConfig.DynamicConfigsDir == "" {
@@ -83,6 +108,41 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 				Success: false,
 				Error:   "DynamicConfigsDir is not set",
 			})
+		}
+
+		// Branding asset filenames are owned exclusively by
+		// /api/branding/asset/{kind} (upload/delete). The Settings page also
+		// round-trips them via GET /api/settings, but its local state is stale
+		// once an asset has been uploaded — clicking Save would otherwise
+		// clobber the uploaded basename with the empty string the UI loaded
+		// at page open. Replace whatever the body sent for these three fields
+		// with the values currently on disk so /api/settings can never
+		// regress them.
+		if existing, err := appConfig.ReadPersistedSettings(); err == nil {
+			settings.LogoFile = existing.LogoFile
+			settings.LogoHorizontalFile = existing.LogoHorizontalFile
+			settings.FaviconFile = existing.FaviconFile
+		}
+
+		// The UI reads ApiKeys from GET /api/settings, which already returns the
+		// merged env+runtime list. When the user clicks Save, the same merged
+		// list comes back in the POST body. Strip the env-supplied keys from
+		// the incoming list before we persist or re-merge, otherwise each save
+		// duplicates the env keys on top of the previous merge (#9071).
+		if settings.ApiKeys != nil {
+			envKeys := startupConfig.ApiKeys
+			envSet := make(map[string]struct{}, len(envKeys))
+			for _, k := range envKeys {
+				envSet[k] = struct{}{}
+			}
+			runtimeOnly := make([]string, 0, len(*settings.ApiKeys))
+			for _, k := range *settings.ApiKeys {
+				if _, fromEnv := envSet[k]; fromEnv {
+					continue
+				}
+				runtimeOnly = append(runtimeOnly, k)
+			}
+			settings.ApiKeys = &runtimeOnly
 		}
 
 		settingsFile := filepath.Join(appConfig.DynamicConfigsDir, "runtime_settings.json")
@@ -111,6 +171,53 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 			appConfig.ApiKeys = append(envKeys, runtimeKeys...)
 		}
 
+		// Update backend logging dynamically
+		if settings.EnableBackendLogging != nil {
+			app.ModelLoader().SetBackendLoggingEnabled(*settings.EnableBackendLogging)
+			xlog.Info("Updated backend logging setting", "enableBackendLogging", *settings.EnableBackendLogging)
+		}
+
+		// Update watchdog dynamically for settings that don't require restart
+		if settings.ForceEvictionWhenBusy != nil {
+			currentWD := app.ModelLoader().GetWatchDog()
+			if currentWD != nil {
+				currentWD.SetForceEvictionWhenBusy(*settings.ForceEvictionWhenBusy)
+				xlog.Info("Updated watchdog force eviction when busy setting", "forceEvictionWhenBusy", *settings.ForceEvictionWhenBusy)
+			}
+		}
+
+		// Update ModelLoader LRU eviction retry settings dynamically
+		maxRetries := appConfig.LRUEvictionMaxRetries
+		retryInterval := appConfig.LRUEvictionRetryInterval
+		if settings.LRUEvictionMaxRetries != nil {
+			maxRetries = *settings.LRUEvictionMaxRetries
+		}
+		if settings.LRUEvictionRetryInterval != nil {
+			if dur, err := time.ParseDuration(*settings.LRUEvictionRetryInterval); err == nil {
+				retryInterval = dur
+			}
+		}
+		if settings.LRUEvictionMaxRetries != nil || settings.LRUEvictionRetryInterval != nil {
+			app.ModelLoader().SetLRUEvictionRetrySettings(maxRetries, retryInterval)
+			xlog.Info("Updated LRU eviction retry settings", "maxRetries", maxRetries, "retryInterval", retryInterval)
+		}
+
+		// Update Open Responses store TTL dynamically
+		if settings.OpenResponsesStoreTTL != nil {
+			ttl := time.Duration(0)
+			if *settings.OpenResponsesStoreTTL != "0" && *settings.OpenResponsesStoreTTL != "" {
+				if dur, err := time.ParseDuration(*settings.OpenResponsesStoreTTL); err == nil {
+					ttl = dur
+				} else {
+					xlog.Warn("Invalid Open Responses store TTL format", "ttl", *settings.OpenResponsesStoreTTL, "error", err)
+				}
+			}
+			// Import the store package
+			store := openresponses.GetGlobalStore()
+			store.SetTTL(ttl)
+			xlog.Info("Updated Open Responses store TTL", "ttl", ttl)
+		}
+
 		// Check if agent job retention changed
 		agentJobChanged := settings.AgentJobRetentionDays != nil
 
@@ -118,7 +225,7 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 		if watchdogChanged {
 			if settings.WatchdogEnabled != nil && !*settings.WatchdogEnabled {
 				if err := app.StopWatchdog(); err != nil {
-					log.Error().Err(err).Msg("Failed to stop watchdog")
+					xlog.Error("Failed to stop watchdog", "error", err)
 					return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 						Success: false,
 						Error:   "Settings saved but failed to stop watchdog: " + err.Error(),
@@ -126,7 +233,7 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 				}
 			} else {
 				if err := app.RestartWatchdog(); err != nil {
-					log.Error().Err(err).Msg("Failed to restart watchdog")
+					xlog.Error("Failed to restart watchdog", "error", err)
 					return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 						Success: false,
 						Error:   "Settings saved but failed to restart watchdog: " + err.Error(),
@@ -138,7 +245,7 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 		// Restart agent job service if retention days changed
 		if agentJobChanged {
 			if err := app.RestartAgentJobService(); err != nil {
-				log.Error().Err(err).Msg("Failed to restart agent job service")
+				xlog.Error("Failed to restart agent job service", "error", err)
 				return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 					Success: false,
 					Error:   "Settings saved but failed to restart agent job service: " + err.Error(),
@@ -151,20 +258,15 @@ func UpdateSettingsEndpoint(app *application.Application) echo.HandlerFunc {
 		if p2pChanged {
 			if settings.P2PToken != nil && *settings.P2PToken == "" {
 				if err := app.StopP2P(); err != nil {
-					log.Error().Err(err).Msg("Failed to stop P2P")
+					xlog.Error("Failed to stop P2P", "error", err)
 					return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 						Success: false,
 						Error:   "Settings saved but failed to stop P2P: " + err.Error(),
 					})
 				}
 			} else {
-				if settings.P2PToken != nil && *settings.P2PToken == "0" {
-					token := p2p.GenerateToken(60, 60)
-					settings.P2PToken = &token
-					appConfig.P2PToken = token
-				}
 				if err := app.RestartP2P(); err != nil {
-					log.Error().Err(err).Msg("Failed to restart P2P")
+					xlog.Error("Failed to restart P2P", "error", err)
 					return c.JSON(http.StatusInternalServerError, schema.SettingsResponse{
 						Success: false,
 						Error:   "Settings saved but failed to restart P2P: " + err.Error(),

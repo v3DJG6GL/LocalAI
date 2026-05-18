@@ -3,21 +3,11 @@ package routes
 import (
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/config"
-	"github.com/mudler/LocalAI/core/http/middleware"
-	"github.com/mudler/LocalAI/core/services"
-	"github.com/mudler/LocalAI/internal"
+	"github.com/mudler/LocalAI/core/services/galleryop"
 )
 
-func registerGalleryRoutes(app *echo.Echo, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig, galleryService *services.GalleryService, opcache *services.OpCache) {
-	app.GET("/browse", func(c echo.Context) error {
-		summary := map[string]interface{}{
-			"Title":        "LocalAI - Models",
-			"BaseURL":      middleware.BaseURL(c),
-			"Version":      internal.PrintableVersion(),
-			"Repositories": appConfig.Galleries,
-		}
-
-		// Render index - models are now loaded via Alpine.js from /api/models
-		return c.Render(200, "views/models", summary)
-	})
+func registerGalleryRoutes(app *echo.Echo, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig, galleryService *galleryop.GalleryService, opcache *galleryop.OpCache) {
+	// Gallery routes are now handled by the React SPA at /app/browse
+	// This function is kept for backward compatibility but no longer registers routes
+	// (routes are registered directly in RegisterUIRoutes)
 }

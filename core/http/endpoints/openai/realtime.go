@@ -3,10 +3,12 @@ package openai
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -16,87 +18,204 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/mudler/LocalAI/core/application"
+	"github.com/mudler/LocalAI/core/backend"
+
 	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/http/auth"
+	mcpTools "github.com/mudler/LocalAI/core/http/endpoints/mcp"
 	"github.com/mudler/LocalAI/core/http/endpoints/openai/types"
+	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/core/templates"
 	laudio "github.com/mudler/LocalAI/pkg/audio"
 	"github.com/mudler/LocalAI/pkg/functions"
+	"github.com/mudler/LocalAI/pkg/grpc"
 	"github.com/mudler/LocalAI/pkg/grpc/proto"
 	model "github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/reasoning"
 	"github.com/mudler/LocalAI/pkg/sound"
+	"github.com/mudler/LocalAI/pkg/utils"
 
-	"google.golang.org/grpc"
-
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 const (
-	localSampleRate  = 16000
-	remoteSampleRate = 24000
-	vadModel         = "silero-vad-ggml"
+	// XXX: Presently it seems all ASR/VAD backends use 16Khz. If a backend uses 24Khz then it will likely still work, but have reduced performance
+	localSampleRate         = 16000
+	defaultRemoteSampleRate = 24000
+	// Maximum audio buffer size in bytes (100MB) to prevent memory exhaustion
+	maxAudioBufferSize = 100 * 1024 * 1024
+	// Maximum WebSocket message size in bytes (10MB) to prevent DoS attacks
+	maxWebSocketMessageSize = 10 * 1024 * 1024
+
+	defaultInstructions = "You are a helpful voice assistant. " +
+		"Your responses will be spoken aloud using text-to-speech, so keep them concise and conversational. " +
+		"Do not use markdown formatting, bullet points, numbered lists, code blocks, or special characters. " +
+		"Speak naturally as you would in a phone conversation. " +
+		"Avoid parenthetical asides, URLs, and anything that cannot be clearly vocalized."
 )
+
+// resolveOutputModalities returns the effective output modalities for a
+// response: response-level overrides session-level, and the OpenAI Realtime
+// spec default is ["audio"] when neither is set.
+func resolveOutputModalities(session, response []types.Modality) []types.Modality {
+	if len(response) > 0 {
+		return response
+	}
+	if len(session) > 0 {
+		return session
+	}
+	return []types.Modality{types.ModalityAudio}
+}
+
+// modalitiesContainAudio reports whether the resolved modalities include audio
+// output.
+func modalitiesContainAudio(m []types.Modality) bool {
+	for _, x := range m {
+		if x == types.ModalityAudio {
+			return true
+		}
+	}
+	return false
+}
 
 // A model can be "emulated" that is: transcribe audio to text -> feed text to the LLM -> generate audio as result
 // If the model support instead audio-to-audio, we will use the specific gRPC calls instead
 
 // Session represents a single WebSocket connection and its state
 type Session struct {
-	ID                      string
-	TranscriptionOnly       bool
-	Model                   string
+	ID                string
+	TranscriptionOnly bool
+	// The pipeline or any-to-any model name (full realtime mode)
+	Model string
+	// The voice may be a TTS model name or a parameter passed to a TTS model
 	Voice                   string
-	TurnDetection           *types.ServerTurnDetection `json:"turn_detection"` // "server_vad" or "none"
-	InputAudioTranscription *types.InputAudioTranscription
-	Functions               functions.Functions
+	TurnDetection           *types.TurnDetectionUnion // "server_vad", "semantic_vad" or "none"
+	InputAudioTranscription *types.AudioTranscription
+	Tools                   []types.ToolUnion
+	ToolChoice              *types.ToolChoiceUnion
 	Conversations           map[string]*Conversation
 	InputAudioBuffer        []byte
 	AudioBufferLock         sync.Mutex
+	OpusFrames              [][]byte
+	OpusFramesLock          sync.Mutex
 	Instructions            string
 	DefaultConversationID   string
 	ModelInterface          Model
+	// The pipeline model config or the config for an any-to-any model
+	ModelConfig      *config.ModelConfig
+	InputSampleRate  int
+	OutputSampleRate int
+	MaxOutputTokens  types.IntOrInf
+	// OutputModalities mirrors the OpenAI Realtime spec field of the same
+	// name. Empty means "use the spec default" (audio). ["text"] suppresses
+	// TTS so the client receives only response.output_text.* events.
+	OutputModalities []types.Modality
+	// MaxHistoryItems caps the number of MessageItems passed to the LLM each
+	// turn (0 = unlimited). Small models — especially the LFM2.5-Audio 1.5B
+	// served via the liquid-audio backend — degrade quickly past a handful
+	// of turns. Counted from the tail; FunctionCall + FunctionCallOutput
+	// pairs are kept together so we never feed an orphaned tool result.
+	MaxHistoryItems int
+
+	// AssistantExecutor is non-nil when the session opted into the in-process
+	// LocalAI Assistant tool surface. Tool calls whose name matches this
+	// executor's catalog are run inproc and their output is fed back to the
+	// model server-side; the client never sees a function_call_arguments
+	// event for those. Mirrors the chat handler's metadata.localai_assistant
+	// path.
+	AssistantExecutor mcpTools.ToolExecutor
+
+	// AssistantTools is the cached ToolUnion slice we injected at session
+	// creation. Re-applied after every client session.update so a
+	// client-driven tool refresh (e.g. toggling a client MCP server) doesn't
+	// silently strip Manage Mode's tools.
+	AssistantTools []types.ToolUnion
+
+	// Response cancellation: protects activeResponseCancel/activeResponseDone
+	responseMu           sync.Mutex
+	activeResponseCancel context.CancelFunc
+	activeResponseDone   chan struct{}
 }
 
-func (s *Session) FromClient(session *types.ClientSession) {
-}
+// cancelActiveResponse cancels any in-flight response and waits for its
+// goroutine to exit. This ensures we never have overlapping responses and
+// that interrupted responses are fully cleaned up before starting a new one.
+func (s *Session) cancelActiveResponse() {
+	s.responseMu.Lock()
+	cancel := s.activeResponseCancel
+	done := s.activeResponseDone
+	s.responseMu.Unlock()
 
-func (s *Session) ToServer() types.ServerSession {
-	return types.ServerSession{
-		ID: s.ID,
-		Object: func() string {
-			if s.TranscriptionOnly {
-				return "realtime.transcription_session"
-			} else {
-				return "realtime.session"
-			}
-		}(),
-		Model:                   s.Model,
-		Modalities:              []types.Modality{types.ModalityText, types.ModalityAudio},
-		Instructions:            s.Instructions,
-		Voice:                   s.Voice,
-		InputAudioFormat:        types.AudioFormatPcm16,
-		OutputAudioFormat:       types.AudioFormatPcm16,
-		TurnDetection:           s.TurnDetection,
-		InputAudioTranscription: s.InputAudioTranscription,
-		// TODO: Should be constructed from Functions?
-		Tools: []types.Tool{},
-		// TODO: ToolChoice
-		// TODO: Temperature
-		// TODO: MaxOutputTokens
-		// TODO: InputAudioNoiseReduction
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
 	}
 }
 
-// TODO: Update to tools?
-// FunctionCall represents a function call initiated by the model
-type FunctionCall struct {
-	Name      string                 `json:"name"`
-	Arguments map[string]interface{} `json:"arguments"`
+// startResponse cancels any active response and returns a new context for
+// the replacement response. The caller MUST close the returned done channel
+// when the response goroutine exits.
+func (s *Session) startResponse(parent context.Context) (context.Context, chan struct{}) {
+	s.cancelActiveResponse()
+
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+
+	s.responseMu.Lock()
+	s.activeResponseCancel = cancel
+	s.activeResponseDone = done
+	s.responseMu.Unlock()
+
+	return ctx, done
+}
+
+func (s *Session) FromClient(session *types.SessionUnion) {
+}
+
+func (s *Session) ToServer() types.SessionUnion {
+	if s.TranscriptionOnly {
+		return types.SessionUnion{
+			Transcription: &types.TranscriptionSession{
+				ID:     s.ID,
+				Object: "realtime.transcription_session",
+				Audio: &types.TranscriptionSessionAudio{
+					Input: &types.SessionAudioInput{
+						Transcription: s.InputAudioTranscription,
+					},
+				},
+			},
+		}
+	} else {
+		return types.SessionUnion{
+			Realtime: &types.RealtimeSession{
+				ID:               s.ID,
+				Object:           "realtime.session",
+				Model:            s.Model,
+				Instructions:     s.Instructions,
+				Tools:            s.Tools,
+				ToolChoice:       s.ToolChoice,
+				MaxOutputTokens:  s.MaxOutputTokens,
+				OutputModalities: s.OutputModalities,
+				Audio: &types.RealtimeSessionAudio{
+					Input: &types.SessionAudioInput{
+						TurnDetection: s.TurnDetection,
+						Transcription: s.InputAudioTranscription,
+					},
+					Output: &types.SessionAudioOutput{
+						Voice: types.Voice(s.Voice),
+					},
+				},
+			},
+		}
+	}
 }
 
 // Conversation represents a conversation with a list of items
 type Conversation struct {
 	ID    string
-	Items []*types.MessageItem
+	Items []*types.MessageItemUnion
 	Lock  sync.Mutex
 }
 
@@ -107,66 +226,16 @@ func (c *Conversation) ToServer() types.Conversation {
 	}
 }
 
-// Item represents a message, function_call, or function_call_output
-type Item struct {
-	ID           string                `json:"id"`
-	Object       string                `json:"object"`
-	Type         string                `json:"type"` // "message", "function_call", "function_call_output"
-	Status       string                `json:"status"`
-	Role         string                `json:"role"`
-	Content      []ConversationContent `json:"content,omitempty"`
-	FunctionCall *FunctionCall         `json:"function_call,omitempty"`
-}
-
-// ConversationContent represents the content of an item
-type ConversationContent struct {
-	Type  string `json:"type"` // "input_text", "input_audio", "text", "audio", etc.
-	Audio string `json:"audio,omitempty"`
-	Text  string `json:"text,omitempty"`
-	// Additional fields as needed
-}
-
-// Define the structures for incoming messages
-type IncomingMessage struct {
-	Type     types.ClientEventType `json:"type"`
-	Session  json.RawMessage       `json:"session,omitempty"`
-	Item     json.RawMessage       `json:"item,omitempty"`
-	Audio    string                `json:"audio,omitempty"`
-	Response json.RawMessage       `json:"response,omitempty"`
-	Error    *ErrorMessage         `json:"error,omitempty"`
-	// Other fields as needed
-}
-
-// ErrorMessage represents an error message sent to the client
-type ErrorMessage struct {
-	Type    string `json:"type"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Param   string `json:"param,omitempty"`
-	EventID string `json:"event_id,omitempty"`
-}
-
-// Define a structure for outgoing messages
-type OutgoingMessage struct {
-	Type         string        `json:"type"`
-	Session      *Session      `json:"session,omitempty"`
-	Conversation *Conversation `json:"conversation,omitempty"`
-	Item         *Item         `json:"item,omitempty"`
-	Content      string        `json:"content,omitempty"`
-	Audio        string        `json:"audio,omitempty"`
-	Error        *ErrorMessage `json:"error,omitempty"`
-}
-
 // Map to store sessions (in-memory)
 var sessions = make(map[string]*Session)
 var sessionLock sync.Mutex
 
-// TODO: implement interface as we start to define usages
 type Model interface {
-	VAD(ctx context.Context, in *proto.VADRequest, opts ...grpc.CallOption) (*proto.VADResponse, error)
-	Transcribe(ctx context.Context, in *proto.TranscriptRequest, opts ...grpc.CallOption) (*proto.TranscriptResult, error)
-	Predict(ctx context.Context, in *proto.PredictOptions, opts ...grpc.CallOption) (*proto.Reply, error)
-	PredictStream(ctx context.Context, in *proto.PredictOptions, f func(*proto.Reply), opts ...grpc.CallOption) error
+	VAD(ctx context.Context, request *schema.VADRequest) (*schema.VADResponse, error)
+	Transcribe(ctx context.Context, audio, language string, translate bool, diarize bool, prompt string) (*schema.TranscriptionResult, error)
+	Predict(ctx context.Context, messages schema.Messages, images, videos, audios []string, tokenCallback func(string, backend.TokenUsage) bool, tools []types.ToolUnion, toolChoice *types.ToolChoiceUnion, logprobs *int, topLogprobs *int, logitBias map[string]float64) (func() (backend.LLMResponse, error), error)
+	TTS(ctx context.Context, text, voice, language string) (string, *proto.Result, error)
+	PredictConfig() *config.ModelConfig
 }
 
 var upgrader = websocket.Upgrader{
@@ -188,6 +257,19 @@ func RealtimeTranscriptionSession(application *application.Application) echo.Han
 	}
 }
 
+// RealtimeSessionOptions bundles per-session knobs decoded from the WS query
+// string (or the WebRTC handshake body). Mirrors what chat.go pulls off
+// `metadata.localai_assistant` — admin-only opt-in to the in-process
+// management tool surface.
+type RealtimeSessionOptions struct {
+	LocalAIAssistant bool
+	// AuthEnabled mirrors chat.go's requireAssistantAccess gate. We resolve
+	// admin role at handshake time (where the echo.Context has the auth
+	// cookie/Bearer) and drop the result here so runRealtimeSession can
+	// decide without holding onto the request.
+	IsAdmin bool
+}
+
 func Realtime(application *application.Application) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
@@ -196,459 +278,848 @@ func Realtime(application *application.Application) echo.HandlerFunc {
 		}
 		defer ws.Close()
 
+		// Set maximum message size to prevent DoS attacks
+		ws.SetReadLimit(maxWebSocketMessageSize)
+
 		// Extract query parameters from Echo context before passing to websocket handler
 		model := c.QueryParam("model")
-		if model == "" {
-			model = "gpt-4o"
+		assistantFlag, _ := strconv.ParseBool(c.QueryParam("localai_assistant"))
+		opts := RealtimeSessionOptions{
+			LocalAIAssistant: assistantFlag,
+			IsAdmin:          isCurrentUserAdmin(c, application),
 		}
-		intent := c.QueryParam("intent")
 
-		registerRealtime(application, model, intent)(ws)
+		registerRealtime(application, model, opts)(ws)
 		return nil
 	}
 }
 
-func registerRealtime(application *application.Application, model, intent string) func(c *websocket.Conn) {
-	return func(c *websocket.Conn) {
+// isCurrentUserAdmin replicates the chat-side admin check at the realtime
+// handshake. When auth is disabled, every caller is treated as admin (same
+// as chat's requireAssistantAccess).
+func isCurrentUserAdmin(c echo.Context, application *application.Application) bool {
+	if application == nil || application.ApplicationConfig() == nil || !application.ApplicationConfig().Auth.Enabled {
+		return true
+	}
+	user := auth.GetUser(c)
+	return user != nil && user.Role == auth.RoleAdmin
+}
 
+func registerRealtime(application *application.Application, model string, opts RealtimeSessionOptions) func(c *websocket.Conn) {
+	return func(conn *websocket.Conn) {
+		t := NewWebSocketTransport(conn)
 		evaluator := application.TemplatesEvaluator()
-		log.Debug().Msgf("WebSocket connection established with '%s'", c.RemoteAddr().String())
-		if intent != "transcription" {
-			sendNotImplemented(c, "Only transcription mode is supported which requires the intent=transcription parameter")
+		xlog.Debug("Realtime WebSocket connection established", "address", conn.RemoteAddr().String(), "model", model)
+		runRealtimeSession(application, t, model, evaluator, opts)
+	}
+}
+
+// defaultMaxHistoryItems picks a sensible default cap for the session.
+// Small any-to-any audio models degrade quickly past a handful of turns;
+// legacy pipelines composing larger LLMs keep the historical "unlimited"
+// default and rely on the LLM's own context window.
+func defaultMaxHistoryItems(cfg *config.ModelConfig) int {
+	if cfg != nil && cfg.HasUsecases(config.FLAG_REALTIME_AUDIO) {
+		return 6
+	}
+	return 0
+}
+
+// trimRealtimeItems returns the tail of items capped at maxItems (0 = no cap).
+// Walks backwards keeping function_call + function_call_output pairs together
+// so we never feed the LLM an orphaned tool result that references a call it
+// can't see.
+func trimRealtimeItems(items []*types.MessageItemUnion, maxItems int) []*types.MessageItemUnion {
+	if maxItems <= 0 || len(items) <= maxItems {
+		return items
+	}
+	// Find the cut point starting from len-maxItems and pull it left until
+	// we're not in the middle of a tool-call pair.
+	cut := len(items) - maxItems
+	for cut > 0 && items[cut] != nil && items[cut].FunctionCallOutput != nil {
+		cut--
+	}
+	return items[cut:]
+}
+
+// prepareRealtimeConfig validates a model config for use in a realtime session
+// and fills in pipeline slots for self-contained any-to-any models. It returns
+// an error code + message pair suitable for sendError; the bool indicates
+// whether the caller should proceed. Extracted from runRealtimeSession so the
+// gate logic can be exercised in unit tests without a full Application.
+func prepareRealtimeConfig(cfg *config.ModelConfig) (errCode, errMsg string, ok bool) {
+	if cfg == nil {
+		return "invalid_model", "Model is not a pipeline model", false
+	}
+
+	// Self-contained any-to-any models (e.g. liquid-audio) own the whole
+	// loop in one engine — surface them by populating empty pipeline slots
+	// with the model's own name so newModel can resolve a config for each
+	// role. The user can still pin individual slots (e.g. Pipeline.VAD =
+	// silero-vad) and those wins.
+	if cfg.HasUsecases(config.FLAG_REALTIME_AUDIO) {
+		if cfg.Pipeline.VAD == "" {
+			cfg.Pipeline.VAD = cfg.Name
 		}
-
-		log.Debug().Msgf("Realtime params: model=%s, intent=%s", model, intent)
-
-		sessionID := generateSessionID()
-		session := &Session{
-			ID:                sessionID,
-			TranscriptionOnly: true,
-			Model:             model,   // default model
-			Voice:             "alloy", // default voice
-			TurnDetection: &types.ServerTurnDetection{
-				Type: types.ServerTurnDetectionTypeServerVad,
-				TurnDetectionParams: types.TurnDetectionParams{
-					// TODO: Need some way to pass this to the backend
-					Threshold: 0.5,
-					// TODO: This is ignored and the amount of padding is random at present
-					PrefixPaddingMs:   30,
-					SilenceDurationMs: 500,
-					CreateResponse:    func() *bool { t := true; return &t }(),
-				},
-			},
-			InputAudioTranscription: &types.InputAudioTranscription{
-				Model: "whisper-1",
-			},
-			Conversations: make(map[string]*Conversation),
+		if cfg.Pipeline.Transcription == "" {
+			cfg.Pipeline.Transcription = cfg.Name
 		}
-
-		// Create a default conversation
-		conversationID := generateConversationID()
-		conversation := &Conversation{
-			ID:    conversationID,
-			Items: []*types.MessageItem{},
+		if cfg.Pipeline.LLM == "" {
+			cfg.Pipeline.LLM = cfg.Name
 		}
-		session.Conversations[conversationID] = conversation
-		session.DefaultConversationID = conversationID
-
-		// TODO: The API has no way to configure the VAD model or other models that make up a pipeline to fake any-to-any
-		//       So possibly we could have a way to configure a composite model that can be used in situations where any-to-any is expected
-		pipeline := config.Pipeline{
-			VAD:           vadModel,
-			Transcription: session.InputAudioTranscription.Model,
+		if cfg.Pipeline.TTS == "" {
+			cfg.Pipeline.TTS = cfg.Name
 		}
+		return "", "", true
+	}
 
-		m, cfg, err := newTranscriptionOnlyModel(
-			&pipeline,
-			application.ModelConfigLoader(),
-			application.ModelLoader(),
-			application.ApplicationConfig(),
-		)
-		if err != nil {
-			log.Error().Msgf("failed to load model: %s", err.Error())
-			sendError(c, "model_load_error", "Failed to load model", "", "")
+	if cfg.Pipeline.VAD == "" && cfg.Pipeline.Transcription == "" && cfg.Pipeline.TTS == "" && cfg.Pipeline.LLM == "" {
+		return "invalid_model", "Model is not a pipeline model", false
+	}
+	return "", "", true
+}
+
+// runRealtimeSession runs the main event loop for a realtime session.
+// It is transport-agnostic and works with both WebSocket and WebRTC.
+func runRealtimeSession(application *application.Application, t Transport, model string, evaluator *templates.Evaluator, opts RealtimeSessionOptions) {
+	cl := application.ModelConfigLoader()
+	cfg, err := cl.LoadModelConfigFileByNameDefaultOptions(model, application.ApplicationConfig())
+	if err != nil {
+		xlog.Error("failed to load model config", "error", err)
+		sendError(t, "model_load_error", "Failed to load model config", "", "")
+		return
+	}
+
+	if code, msg, ok := prepareRealtimeConfig(cfg); !ok {
+		xlog.Error("model is not a pipeline", "model", model)
+		sendError(t, code, msg, "", "")
+		return
+	}
+
+	// LocalAI Assistant opt-in: gate on admin (same rule as chat.go's
+	// requireAssistantAccess) and grab the process-wide holder's executor.
+	// We collect tools + system prompt here and merge them into the session
+	// below so they're live from the first response.create.
+	var assistantTools []types.ToolUnion
+	var assistantSystemPrompt string
+	var assistantExecutor mcpTools.ToolExecutor
+	if opts.LocalAIAssistant {
+		if !opts.IsAdmin {
+			sendError(t, "forbidden", "localai_assistant requires admin", "", "")
 			return
 		}
-		session.ModelInterface = m
+		appCfg := application.ApplicationConfig()
+		if appCfg != nil && appCfg.DisableLocalAIAssistant {
+			sendError(t, "unavailable", "LocalAI Assistant is disabled on this server", "", "")
+			return
+		}
+		holder := application.LocalAIAssistant()
+		if holder == nil || !holder.HasTools() {
+			sendError(t, "unavailable", "LocalAI Assistant is not available on this server", "", "")
+			return
+		}
+		exec := holder.Executor()
+		fns, discErr := exec.DiscoverTools(context.Background())
+		if discErr != nil {
+			xlog.Error("realtime: failed to discover LocalAI Assistant tools", "error", discErr)
+			sendError(t, "tool_discovery_failed", "failed to discover assistant tools: "+discErr.Error(), "", "")
+			return
+		}
+		assistantExecutor = exec
+		assistantSystemPrompt = holder.SystemPrompt()
+		assistantTools = make([]types.ToolUnion, 0, len(fns))
+		for _, fn := range fns {
+			fnCopy := fn
+			assistantTools = append(assistantTools, types.ToolUnion{
+				Function: &types.ToolFunction{
+					Name:        fnCopy.Name,
+					Description: fnCopy.Description,
+					Parameters:  fnCopy.Parameters,
+				},
+			})
+		}
+		xlog.Debug("realtime: LocalAI Assistant tools injected", "count", len(fns))
+	}
 
-		// Store the session
-		sessionLock.Lock()
-		sessions[sessionID] = session
-		sessionLock.Unlock()
+	sttModel := cfg.Pipeline.Transcription
 
-		sendEvent(c, types.TranscriptionSessionCreatedEvent{
-			ServerEventBase: types.ServerEventBase{
-				EventID: "event_TODO",
-				Type:    types.ServerEventTypeTranscriptionSessionCreated,
+	// Compose the system prompt: prepend the assistant prompt when we have
+	// one (it teaches the model the safety rules and tool recipes), then the
+	// session's default voice instructions. Order matches chat.go's
+	// hasSystemMessage check — assistant prompt comes first.
+	instructions := defaultInstructions
+	if assistantSystemPrompt != "" {
+		instructions = assistantSystemPrompt + "\n\n" + defaultInstructions
+	}
+
+	sessionID := generateSessionID()
+	session := &Session{
+		ID:                sessionID,
+		TranscriptionOnly: false,
+		Model:             model,
+		Voice:             cfg.TTSConfig.Voice,
+		Instructions:      instructions,
+		ModelConfig:       cfg,
+		Tools:             assistantTools,
+		AssistantTools:    assistantTools,
+		AssistantExecutor: assistantExecutor,
+		TurnDetection: &types.TurnDetectionUnion{
+			ServerVad: &types.ServerVad{
+				Threshold:         0.5,
+				PrefixPaddingMs:   300,
+				SilenceDurationMs: 500,
+				CreateResponse:    true,
 			},
-			Session: session.ToServer(),
-		})
+		},
+		InputAudioTranscription: &types.AudioTranscription{
+			Model: sttModel,
+		},
+		Conversations:    make(map[string]*Conversation),
+		InputSampleRate:  defaultRemoteSampleRate,
+		OutputSampleRate: defaultRemoteSampleRate,
+		MaxHistoryItems:  defaultMaxHistoryItems(cfg),
+	}
 
-		var (
-			// mt   int
-			msg  []byte
-			wg   sync.WaitGroup
+	// Create a default conversation
+	conversationID := generateConversationID()
+	conversation := &Conversation{
+		ID: conversationID,
+		// TODO: We need to truncate the conversation items when a new item is added and we have run out of space. There are multiple places where items
+		//       can be added so we could use a datastructure here that enforces truncation upon addition
+		Items: []*types.MessageItemUnion{},
+	}
+	session.Conversations[conversationID] = conversation
+	session.DefaultConversationID = conversationID
+
+	m, err := newModel(
+		&cfg.Pipeline,
+		application.ModelConfigLoader(),
+		application.ModelLoader(),
+		application.ApplicationConfig(),
+		evaluator,
+	)
+	if err != nil {
+		xlog.Error("failed to load model", "error", err)
+		sendError(t, "model_load_error", "Failed to load model", "", "")
+		return
+	}
+	session.ModelInterface = m
+
+	// Store the session and notify the transport (for WebRTC audio track handling)
+	sessionLock.Lock()
+	sessions[sessionID] = session
+	sessionLock.Unlock()
+
+	// For WebRTC, inbound audio arrives as Opus (48kHz) and is decoded+resampled
+	// to localSampleRate in handleIncomingAudioTrack. Set InputSampleRate to
+	// match so handleVAD doesn't needlessly double-resample.
+	if _, ok := t.(*WebRTCTransport); ok {
+		session.InputSampleRate = localSampleRate
+	}
+
+	if sn, ok := t.(interface{ SetSession(*Session) }); ok {
+		sn.SetSession(session)
+	}
+
+	sendEvent(t, types.SessionCreatedEvent{
+		ServerEventBase: types.ServerEventBase{
+			EventID: "event_TODO",
+		},
+		Session: session.ToServer(),
+	})
+
+	var (
+		msg  []byte
+		wg   sync.WaitGroup
+		done = make(chan struct{})
+	)
+
+	vadServerStarted := false
+	toggleVAD := func() {
+		if session.TurnDetection != nil && session.TurnDetection.ServerVad != nil && !vadServerStarted {
+			xlog.Debug("Starting VAD goroutine...")
 			done = make(chan struct{})
-		)
+			wg.Go(func() {
+				conversation := session.Conversations[session.DefaultConversationID]
+				handleVAD(session, conversation, t, done)
+			})
+			vadServerStarted = true
+		} else if (session.TurnDetection == nil || session.TurnDetection.ServerVad == nil) && vadServerStarted {
+			xlog.Debug("Stopping VAD goroutine...")
+			close(done)
+			vadServerStarted = false
+		}
+	}
 
-		vadServerStarted := true
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conversation := session.Conversations[session.DefaultConversationID]
-			handleVAD(cfg, evaluator, session, conversation, c, done)
-		}()
+	// For WebRTC sessions, start the Opus decode loop before VAD so that
+	// decoded PCM is already flowing when VAD's first tick fires.
+	var decodeDone chan struct{}
+	if wt, ok := t.(*WebRTCTransport); ok {
+		decodeDone = make(chan struct{})
+		go decodeOpusLoop(session, wt.opusBackend, decodeDone)
+	}
 
-		for {
-			if _, msg, err = c.ReadMessage(); err != nil {
-				log.Error().Msgf("read: %s", err.Error())
-				break
+	toggleVAD()
+
+	for {
+		msg, err = t.ReadEvent()
+		if err != nil {
+			xlog.Error("read error", "error", err)
+			break
+		}
+
+		// Handle diagnostic events that aren't part of the OpenAI protocol
+		var rawType struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(msg, &rawType) == nil && rawType.Type == "test_tone" {
+			if _, ok := t.(*WebSocketTransport); ok {
+				sendError(t, "not_supported", "test_tone is only supported on WebRTC connections", "", "")
+			} else {
+				xlog.Debug("Generating test tone")
+				go sendTestTone(t)
+			}
+			continue
+		}
+
+		// Parse the incoming message
+		event, err := types.UnmarshalClientEvent(msg)
+		if err != nil {
+			xlog.Error("invalid json", "error", err)
+			sendError(t, "invalid_json", "Invalid JSON format", "", "")
+			continue
+		}
+
+		switch e := event.(type) {
+		case types.SessionUpdateEvent:
+			xlog.Debug("recv", "message", string(msg))
+
+			// Handle transcription session update
+			if e.Session.Transcription != nil {
+				if err := updateTransSession(
+					session,
+					&e.Session,
+					application.ModelConfigLoader(),
+					application.ModelLoader(),
+					application.ApplicationConfig(),
+				); err != nil {
+					xlog.Error("failed to update session", "error", err)
+					sendError(t, "session_update_error", "Failed to update session", "", "")
+					continue
+				}
+
+				toggleVAD()
+
+				sendEvent(t, types.SessionUpdatedEvent{
+					ServerEventBase: types.ServerEventBase{
+						EventID: "event_TODO",
+					},
+					Session: session.ToServer(),
+				})
 			}
 
-			// Parse the incoming message
-			var incomingMsg IncomingMessage
-			if err := json.Unmarshal(msg, &incomingMsg); err != nil {
-				log.Error().Msgf("invalid json: %s", err.Error())
-				sendError(c, "invalid_json", "Invalid JSON format", "", "")
+			// Handle realtime session update
+			if e.Session.Realtime != nil {
+				if err := updateSession(
+					session,
+					&e.Session,
+					application.ModelConfigLoader(),
+					application.ModelLoader(),
+					application.ApplicationConfig(),
+					evaluator,
+				); err != nil {
+					xlog.Error("failed to update session", "error", err)
+					sendError(t, "session_update_error", "Failed to update session", "", "")
+					continue
+				}
+
+				toggleVAD()
+
+				sendEvent(t, types.SessionUpdatedEvent{
+					ServerEventBase: types.ServerEventBase{
+						EventID: "event_TODO",
+					},
+					Session: session.ToServer(),
+				})
+			}
+
+		case types.InputAudioBufferAppendEvent:
+			// Handle 'input_audio_buffer.append'
+			if e.Audio == "" {
+				xlog.Error("Audio data is missing in 'input_audio_buffer.append'")
+				sendError(t, "missing_audio_data", "Audio data is missing", "", "")
 				continue
 			}
 
-			var sessionUpdate types.ClientSession
-			switch incomingMsg.Type {
-			case types.ClientEventTypeTranscriptionSessionUpdate:
-				log.Debug().Msgf("recv: %s", msg)
-
-				if err := json.Unmarshal(incomingMsg.Session, &sessionUpdate); err != nil {
-					log.Error().Msgf("failed to unmarshal 'transcription_session.update': %s", err.Error())
-					sendError(c, "invalid_session_update", "Invalid session update format", "", "")
-					continue
-				}
-				if err := updateTransSession(
-					session,
-					&sessionUpdate,
-					application.ModelConfigLoader(),
-					application.ModelLoader(),
-					application.ApplicationConfig(),
-				); err != nil {
-					log.Error().Msgf("failed to update session: %s", err.Error())
-					sendError(c, "session_update_error", "Failed to update session", "", "")
-					continue
-				}
-
-				sendEvent(c, types.SessionUpdatedEvent{
-					ServerEventBase: types.ServerEventBase{
-						EventID: "event_TODO",
-						Type:    types.ServerEventTypeTranscriptionSessionUpdated,
-					},
-					Session: session.ToServer(),
-				})
-
-			case types.ClientEventTypeSessionUpdate:
-				log.Debug().Msgf("recv: %s", msg)
-
-				// Update session configurations
-				if err := json.Unmarshal(incomingMsg.Session, &sessionUpdate); err != nil {
-					log.Error().Msgf("failed to unmarshal 'session.update': %s", err.Error())
-					sendError(c, "invalid_session_update", "Invalid session update format", "", "")
-					continue
-				}
-				if err := updateSession(
-					session,
-					&sessionUpdate,
-					application.ModelConfigLoader(),
-					application.ModelLoader(),
-					application.ApplicationConfig(),
-				); err != nil {
-					log.Error().Msgf("failed to update session: %s", err.Error())
-					sendError(c, "session_update_error", "Failed to update session", "", "")
-					continue
-				}
-
-				sendEvent(c, types.SessionUpdatedEvent{
-					ServerEventBase: types.ServerEventBase{
-						EventID: "event_TODO",
-						Type:    types.ServerEventTypeSessionUpdated,
-					},
-					Session: session.ToServer(),
-				})
-
-				if session.TurnDetection.Type == types.ServerTurnDetectionTypeServerVad && !vadServerStarted {
-					log.Debug().Msg("Starting VAD goroutine...")
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						conversation := session.Conversations[session.DefaultConversationID]
-						handleVAD(cfg, evaluator, session, conversation, c, done)
-					}()
-					vadServerStarted = true
-				} else if session.TurnDetection.Type != types.ServerTurnDetectionTypeServerVad && vadServerStarted {
-					log.Debug().Msg("Stopping VAD goroutine...")
-
-					wg.Add(-1)
-					go func() {
-						done <- struct{}{}
-					}()
-					vadServerStarted = false
-				}
-			case types.ClientEventTypeInputAudioBufferAppend:
-				// Handle 'input_audio_buffer.append'
-				if incomingMsg.Audio == "" {
-					log.Error().Msg("Audio data is missing in 'input_audio_buffer.append'")
-					sendError(c, "missing_audio_data", "Audio data is missing", "", "")
-					continue
-				}
-
-				// Decode base64 audio data
-				decodedAudio, err := base64.StdEncoding.DecodeString(incomingMsg.Audio)
-				if err != nil {
-					log.Error().Msgf("failed to decode audio data: %s", err.Error())
-					sendError(c, "invalid_audio_data", "Failed to decode audio data", "", "")
-					continue
-				}
-
-				// Append to InputAudioBuffer
-				session.AudioBufferLock.Lock()
-				session.InputAudioBuffer = append(session.InputAudioBuffer, decodedAudio...)
-				session.AudioBufferLock.Unlock()
-
-			case types.ClientEventTypeInputAudioBufferCommit:
-				log.Debug().Msgf("recv: %s", msg)
-
-				// TODO: Trigger transcription.
-				// TODO: Ignore this if VAD enabled or interrupt VAD?
-
-				if session.TranscriptionOnly {
-					continue
-				}
-
-				// Commit the audio buffer to the conversation as a new item
-				item := &types.MessageItem{
-					ID:     generateItemID(),
-					Type:   "message",
-					Status: "completed",
-					Role:   "user",
-					Content: []types.MessageContentPart{
-						{
-							Type:  "input_audio",
-							Audio: base64.StdEncoding.EncodeToString(session.InputAudioBuffer),
-						},
-					},
-				}
-
-				// Add item to conversation
-				conversation.Lock.Lock()
-				conversation.Items = append(conversation.Items, item)
-				conversation.Lock.Unlock()
-
-				// Reset InputAudioBuffer
-				session.AudioBufferLock.Lock()
-				session.InputAudioBuffer = nil
-				session.AudioBufferLock.Unlock()
-
-				// Send item.created event
-				sendEvent(c, types.ConversationItemCreatedEvent{
-					ServerEventBase: types.ServerEventBase{
-						EventID: "event_TODO",
-						Type:    "conversation.item.created",
-					},
-					Item: types.ResponseMessageItem{
-						Object:      "realtime.item",
-						MessageItem: *item,
-					},
-				})
-
-			case types.ClientEventTypeConversationItemCreate:
-				log.Debug().Msgf("recv: %s", msg)
-
-				// Handle creating new conversation items
-				var item types.ConversationItemCreateEvent
-				if err := json.Unmarshal(incomingMsg.Item, &item); err != nil {
-					log.Error().Msgf("failed to unmarshal 'conversation.item.create': %s", err.Error())
-					sendError(c, "invalid_item", "Invalid item format", "", "")
-					continue
-				}
-
-				sendNotImplemented(c, "conversation.item.create")
-
-				// Generate item ID and set status
-				// item.ID = generateItemID()
-				// item.Object = "realtime.item"
-				// item.Status = "completed"
-				//
-				// // Add item to conversation
-				// conversation.Lock.Lock()
-				// conversation.Items = append(conversation.Items, &item)
-				// conversation.Lock.Unlock()
-				//
-				// // Send item.created event
-				// sendEvent(c, OutgoingMessage{
-				// 	Type: "conversation.item.created",
-				// 	Item: &item,
-				// })
-
-			case types.ClientEventTypeConversationItemDelete:
-				sendError(c, "not_implemented", "Deleting items not implemented", "", "event_TODO")
-
-			case types.ClientEventTypeResponseCreate:
-				// Handle generating a response
-				var responseCreate types.ResponseCreateEvent
-				if len(incomingMsg.Response) > 0 {
-					if err := json.Unmarshal(incomingMsg.Response, &responseCreate); err != nil {
-						log.Error().Msgf("failed to unmarshal 'response.create' response object: %s", err.Error())
-						sendError(c, "invalid_response_create", "Invalid response create format", "", "")
-						continue
-					}
-				}
-
-				// Update session functions if provided
-				if len(responseCreate.Response.Tools) > 0 {
-					// TODO: Tools -> Functions
-				}
-
-				sendNotImplemented(c, "response.create")
-
-				// TODO: Generate a response based on the conversation history
-				// wg.Add(1)
-				// go func() {
-				// 	defer wg.Done()
-				// 	generateResponse(cfg, evaluator, session, conversation, responseCreate, c, mt)
-				// }()
-
-			case types.ClientEventTypeResponseCancel:
-				log.Printf("recv: %s", msg)
-
-				// Handle cancellation of ongoing responses
-				// Implement cancellation logic as needed
-				sendNotImplemented(c, "response.cancel")
-
-			default:
-				log.Error().Msgf("unknown message type: %s", incomingMsg.Type)
-				sendError(c, "unknown_message_type", fmt.Sprintf("Unknown message type: %s", incomingMsg.Type), "", "")
+			// Decode base64 audio data
+			decodedAudio, err := base64.StdEncoding.DecodeString(e.Audio)
+			if err != nil {
+				xlog.Error("failed to decode audio data", "error", err)
+				sendError(t, "invalid_audio_data", "Failed to decode audio data", "", "")
+				continue
 			}
+
+			// Check buffer size limits before appending
+			session.AudioBufferLock.Lock()
+			newSize := len(session.InputAudioBuffer) + len(decodedAudio)
+			if newSize > maxAudioBufferSize {
+				session.AudioBufferLock.Unlock()
+				xlog.Error("audio buffer size limit exceeded", "current_size", len(session.InputAudioBuffer), "incoming_size", len(decodedAudio), "limit", maxAudioBufferSize)
+				sendError(t, "buffer_size_exceeded", fmt.Sprintf("Audio buffer size limit exceeded (max %d bytes)", maxAudioBufferSize), "", "")
+				continue
+			}
+
+			// Append to InputAudioBuffer
+			session.InputAudioBuffer = append(session.InputAudioBuffer, decodedAudio...)
+			session.AudioBufferLock.Unlock()
+
+		case types.InputAudioBufferCommitEvent:
+			xlog.Debug("recv", "message", string(msg))
+
+			sessionLock.Lock()
+			isServerVAD := session.TurnDetection != nil && session.TurnDetection.ServerVad != nil
+			sessionLock.Unlock()
+
+			// TODO: At the least need to check locking and timer state in the VAD Go routine before allowing this
+			if isServerVAD {
+				sendNotImplemented(t, "input_audio_buffer.commit in conjunction with VAD")
+				continue
+			}
+
+			session.AudioBufferLock.Lock()
+			allAudio := make([]byte, len(session.InputAudioBuffer))
+			copy(allAudio, session.InputAudioBuffer)
+			session.InputAudioBuffer = nil
+			session.AudioBufferLock.Unlock()
+
+			sendEvent(t, types.InputAudioBufferCommittedEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ItemID:          generateItemID(),
+			})
+
+			respCtx, respDone := session.startResponse(context.Background())
+			go func() {
+				defer close(respDone)
+				commitUtterance(respCtx, allAudio, session, conversation, t)
+			}()
+
+		case types.ConversationItemCreateEvent:
+			xlog.Debug("recv", "message", string(msg))
+			// Add the item to the conversation
+			item := e.Item
+			// Ensure IDs are present
+			if item.User != nil && item.User.ID == "" {
+				item.User.ID = generateItemID()
+			}
+			if item.Assistant != nil && item.Assistant.ID == "" {
+				item.Assistant.ID = generateItemID()
+			}
+			if item.System != nil && item.System.ID == "" {
+				item.System.ID = generateItemID()
+			}
+			if item.FunctionCall != nil && item.FunctionCall.ID == "" {
+				item.FunctionCall.ID = generateItemID()
+			}
+			if item.FunctionCallOutput != nil && item.FunctionCallOutput.ID == "" {
+				item.FunctionCallOutput.ID = generateItemID()
+			}
+
+			conversation.Lock.Lock()
+			conversation.Items = append(conversation.Items, &item)
+			conversation.Lock.Unlock()
+
+			sendEvent(t, types.ConversationItemAddedEvent{
+				ServerEventBase: types.ServerEventBase{
+					EventID: e.EventID,
+				},
+				PreviousItemID: e.PreviousItemID,
+				Item:           item,
+			})
+
+		case types.ConversationItemDeleteEvent:
+			sendError(t, "not_implemented", "Deleting items not implemented", "", "event_TODO")
+
+		case types.ConversationItemRetrieveEvent:
+			xlog.Debug("recv", "message", string(msg))
+
+			if e.ItemID == "" {
+				sendError(t, "invalid_item_id", "Need item_id, but none specified", "", "event_TODO")
+				continue
+			}
+
+			conversation.Lock.Lock()
+			var retrievedItem types.MessageItemUnion
+			for _, item := range conversation.Items {
+				// We need to check ID in the union
+				var id string
+				if item.System != nil {
+					id = item.System.ID
+				} else if item.User != nil {
+					id = item.User.ID
+				} else if item.Assistant != nil {
+					id = item.Assistant.ID
+				} else if item.FunctionCall != nil {
+					id = item.FunctionCall.ID
+				} else if item.FunctionCallOutput != nil {
+					id = item.FunctionCallOutput.ID
+				}
+
+				if id == e.ItemID {
+					retrievedItem = *item
+					break
+				}
+			}
+			conversation.Lock.Unlock()
+
+			sendEvent(t, types.ConversationItemRetrievedEvent{
+				ServerEventBase: types.ServerEventBase{
+					EventID: "event_TODO",
+				},
+				Item: retrievedItem,
+			})
+
+		case types.ResponseCreateEvent:
+			xlog.Debug("recv", "message", string(msg))
+
+			// Handle optional items to add to context
+			if len(e.Response.Input) > 0 {
+				conversation.Lock.Lock()
+				for _, item := range e.Response.Input {
+					// Ensure IDs are present
+					if item.User != nil && item.User.ID == "" {
+						item.User.ID = generateItemID()
+					}
+					if item.Assistant != nil && item.Assistant.ID == "" {
+						item.Assistant.ID = generateItemID()
+					}
+					if item.System != nil && item.System.ID == "" {
+						item.System.ID = generateItemID()
+					}
+					if item.FunctionCall != nil && item.FunctionCall.ID == "" {
+						item.FunctionCall.ID = generateItemID()
+					}
+					if item.FunctionCallOutput != nil && item.FunctionCallOutput.ID == "" {
+						item.FunctionCallOutput.ID = generateItemID()
+					}
+
+					conversation.Items = append(conversation.Items, &item)
+				}
+				conversation.Lock.Unlock()
+			}
+
+			respCtx, respDone := session.startResponse(context.Background())
+			go func() {
+				defer close(respDone)
+				triggerResponse(respCtx, session, conversation, t, &e.Response)
+			}()
+
+		case types.ResponseCancelEvent:
+			xlog.Debug("recv", "message", string(msg))
+			session.cancelActiveResponse()
+
+		default:
+			xlog.Error("unknown message type")
+			// sendError(t, "unknown_message_type", fmt.Sprintf("Unknown message type: %s", incomingMsg.Type), "", "")
 		}
+	}
 
-		// Close the done channel to signal goroutines to exit
+	// Cancel any in-flight response before tearing down
+	session.cancelActiveResponse()
+
+	// Stop the Opus decode goroutine (if running)
+	if decodeDone != nil {
+		close(decodeDone)
+	}
+
+	// Signal any running VAD goroutine to exit.
+	if vadServerStarted {
 		close(done)
-		wg.Wait()
+	}
+	wg.Wait()
 
-		// Remove the session from the sessions map
-		sessionLock.Lock()
-		delete(sessions, sessionID)
-		sessionLock.Unlock()
+	// Remove the session from the sessions map
+	sessionLock.Lock()
+	delete(sessions, sessionID)
+	sessionLock.Unlock()
+}
+
+// sendEvent sends a server event via the transport, logging any errors.
+func sendEvent(t Transport, event types.ServerEvent) {
+	if err := t.SendEvent(event); err != nil {
+		xlog.Error("write error", "error", err)
 	}
 }
 
-// Helper function to send events to the client
-func sendEvent(c *websocket.Conn, event types.ServerEvent) {
-	eventBytes, err := json.Marshal(event)
-	if err != nil {
-		log.Error().Msgf("failed to marshal event: %s", err.Error())
-		return
-	}
-	if err = c.WriteMessage(websocket.TextMessage, eventBytes); err != nil {
-		log.Error().Msgf("write: %s", err.Error())
-	}
-}
-
-// Helper function to send errors to the client
-func sendError(c *websocket.Conn, code, message, param, eventID string) {
+// sendError sends an error event to the client.
+func sendError(t Transport, code, message, param, eventID string) {
 	errorEvent := types.ErrorEvent{
 		ServerEventBase: types.ServerEventBase{
-			Type:    types.ServerEventTypeError,
 			EventID: eventID,
 		},
 		Error: types.Error{
 			Type:    "invalid_request_error",
 			Code:    code,
 			Message: message,
+			Param:   param,
 			EventID: eventID,
 		},
 	}
 
-	sendEvent(c, errorEvent)
+	sendEvent(t, errorEvent)
 }
 
-func sendNotImplemented(c *websocket.Conn, message string) {
-	sendError(c, "not_implemented", message, "", "event_TODO")
+func sendNotImplemented(t Transport, message string) {
+	sendError(t, "not_implemented", message, "", "event_TODO")
 }
 
-func updateTransSession(session *Session, update *types.ClientSession, cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) error {
+// sendTestTone generates a 1-second 440 Hz sine wave and sends it through
+// the transport's audio path. This exercises the full Opus encode → RTP →
+// browser decode pipeline without involving TTS.
+func sendTestTone(t Transport) {
+	const (
+		freq       = 440.0
+		sampleRate = 24000
+		duration   = 1 // seconds
+		amplitude  = 16000
+		numSamples = sampleRate * duration
+	)
+
+	pcm := make([]byte, numSamples*2) // 16-bit samples = 2 bytes each
+	for i := range numSamples {
+		sample := int16(amplitude * math.Sin(2*math.Pi*freq*float64(i)/sampleRate))
+		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(sample))
+	}
+
+	xlog.Debug("Sending test tone", "samples", numSamples, "sample_rate", sampleRate, "freq", freq)
+	if err := t.SendAudio(context.Background(), pcm, sampleRate); err != nil {
+		xlog.Error("test tone send failed", "error", err)
+	}
+}
+
+func updateTransSession(session *Session, update *types.SessionUnion, cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) error {
 	sessionLock.Lock()
 	defer sessionLock.Unlock()
 
-	trUpd := update.InputAudioTranscription
+	// In transcription session update, we look at Transcription field
+	if update.Transcription == nil || update.Transcription.Audio == nil || update.Transcription.Audio.Input == nil {
+		return nil
+	}
+
+	trUpd := update.Transcription.Audio.Input.Transcription
 	trCur := session.InputAudioTranscription
 
+	session.TranscriptionOnly = true
+
 	if trUpd != nil && trUpd.Model != "" && trUpd.Model != trCur.Model {
-		pipeline := config.Pipeline{
-			VAD:           vadModel,
-			Transcription: trUpd.Model,
+		cfg, err := cl.LoadModelConfigFileByNameDefaultOptions(trUpd.Model, appConfig)
+		if err != nil {
+			return err
+		}
+		if cfg == nil || (cfg.Pipeline.VAD == "" || cfg.Pipeline.Transcription == "") {
+			return fmt.Errorf("model is not a valid pipeline model: %s", trUpd.Model)
 		}
 
-		m, _, err := newTranscriptionOnlyModel(&pipeline, cl, ml, appConfig)
+		m, cfg, err := newTranscriptionOnlyModel(&cfg.Pipeline, cl, ml, appConfig)
 		if err != nil {
 			return err
 		}
 
 		session.ModelInterface = m
+		session.ModelConfig = cfg
 	}
 
-	if update.TurnDetection != nil && update.TurnDetection.Type != "" {
-		session.TurnDetection.Type = types.ServerTurnDetectionType(update.TurnDetection.Type)
-		session.TurnDetection.TurnDetectionParams = update.TurnDetection.TurnDetectionParams
+	if trUpd != nil {
+		trCur.Language = trUpd.Language
+		trCur.Prompt = trUpd.Prompt
+	}
+
+	if update.Transcription.Audio.Input.TurnDetectionSet {
+		session.TurnDetection = update.Transcription.Audio.Input.TurnDetection
+	}
+
+	if update.Transcription.Audio.Input.Format != nil && update.Transcription.Audio.Input.Format.PCM != nil {
+		if update.Transcription.Audio.Input.Format.PCM.Rate > 0 {
+			session.InputSampleRate = update.Transcription.Audio.Input.Format.PCM.Rate
+		}
 	}
 
 	return nil
 }
 
-// Function to update session configurations
-func updateSession(session *Session, update *types.ClientSession, cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) error {
+func updateSession(session *Session, update *types.SessionUnion, cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig, evaluator *templates.Evaluator) error {
 	sessionLock.Lock()
 	defer sessionLock.Unlock()
 
-	if update.Model != "" {
-		pipeline := config.Pipeline{
-			LLM: update.Model,
-			// TODO: Setup pipeline by configuring STT and TTS models
+	if update.Realtime == nil {
+		return nil
+	}
+
+	session.TranscriptionOnly = false
+	rt := update.Realtime
+
+	if rt.Model != "" {
+		cfg, err := cl.LoadModelConfigFileByNameDefaultOptions(rt.Model, appConfig)
+		if err != nil {
+			return err
 		}
-		m, err := newModel(&pipeline, cl, ml, appConfig)
+		if cfg == nil || (cfg.Pipeline.VAD == "" || cfg.Pipeline.Transcription == "" || cfg.Pipeline.TTS == "" || cfg.Pipeline.LLM == "") {
+			return fmt.Errorf("model is not a valid pipeline model: %s", rt.Model)
+		}
+
+		if session.InputAudioTranscription == nil {
+			session.InputAudioTranscription = &types.AudioTranscription{}
+		}
+		session.InputAudioTranscription.Model = cfg.Pipeline.Transcription
+		session.Voice = cfg.TTSConfig.Voice
+		session.Model = rt.Model
+		session.ModelConfig = cfg
+	}
+
+	if rt.Audio != nil && rt.Audio.Output != nil && rt.Audio.Output.Voice != "" {
+		session.Voice = string(rt.Audio.Output.Voice)
+	}
+
+	if rt.Audio != nil && rt.Audio.Input != nil && rt.Audio.Input.Transcription != nil {
+		session.InputAudioTranscription = rt.Audio.Input.Transcription
+		session.ModelConfig.Pipeline.Transcription = rt.Audio.Input.Transcription.Model
+	}
+
+	if rt.Model != "" || (rt.Audio != nil && rt.Audio.Output != nil && rt.Audio.Output.Voice != "") || (rt.Audio != nil && rt.Audio.Input != nil && rt.Audio.Input.Transcription != nil) {
+		m, err := newModel(&session.ModelConfig.Pipeline, cl, ml, appConfig, evaluator)
 		if err != nil {
 			return err
 		}
 		session.ModelInterface = m
-		session.Model = update.Model
 	}
 
-	if update.Voice != "" {
-		session.Voice = update.Voice
-	}
-	if update.TurnDetection != nil && update.TurnDetection.Type != "" {
-		session.TurnDetection.Type = types.ServerTurnDetectionType(update.TurnDetection.Type)
-		session.TurnDetection.TurnDetectionParams = update.TurnDetection.TurnDetectionParams
-	}
-	// TODO: We should actually check if the field was present in the JSON; empty string means clear the settings
-	if update.Instructions != "" {
-		session.Instructions = update.Instructions
-	}
-	if update.Tools != nil {
-		return fmt.Errorf("Haven't implemented tools")
+	if rt.Audio != nil && rt.Audio.Input != nil && rt.Audio.Input.TurnDetectionSet {
+		session.TurnDetection = rt.Audio.Input.TurnDetection
 	}
 
-	session.InputAudioTranscription = update.InputAudioTranscription
+	if rt.Audio != nil && rt.Audio.Input != nil && rt.Audio.Input.Format != nil && rt.Audio.Input.Format.PCM != nil {
+		if rt.Audio.Input.Format.PCM.Rate > 0 {
+			session.InputSampleRate = rt.Audio.Input.Format.PCM.Rate
+		}
+	}
+
+	if rt.Audio != nil && rt.Audio.Output != nil && rt.Audio.Output.Format != nil && rt.Audio.Output.Format.PCM != nil {
+		if rt.Audio.Output.Format.PCM.Rate > 0 {
+			session.OutputSampleRate = rt.Audio.Output.Format.PCM.Rate
+		}
+	}
+
+	if rt.Instructions != "" {
+		session.Instructions = rt.Instructions
+	}
+
+	if rt.Tools != nil {
+		// Manage Mode tools survive a client-driven session.update — the
+		// alternative is silently dropping them whenever the user toggles
+		// a client MCP server, which would break the modality mid-session.
+		// Names from rt.Tools win on collision (the client is explicit;
+		// we preserve, we don't override).
+		merged := append([]types.ToolUnion(nil), rt.Tools...)
+		seen := make(map[string]struct{}, len(merged))
+		for _, t := range merged {
+			if t.Function != nil {
+				seen[t.Function.Name] = struct{}{}
+			}
+		}
+		for _, t := range session.AssistantTools {
+			if t.Function == nil {
+				continue
+			}
+			if _, ok := seen[t.Function.Name]; ok {
+				continue
+			}
+			merged = append(merged, t)
+		}
+		session.Tools = merged
+	}
+	if rt.ToolChoice != nil {
+		session.ToolChoice = rt.ToolChoice
+	}
+
+	if rt.MaxOutputTokens != 0 {
+		session.MaxOutputTokens = rt.MaxOutputTokens
+	}
+
+	if len(rt.OutputModalities) > 0 {
+		session.OutputModalities = rt.OutputModalities
+	}
 
 	return nil
+}
+
+// decodeOpusLoop runs a ticker that drains buffered raw Opus frames from the
+// session, decodes them in a single batched gRPC call, and appends the
+// resulting PCM to InputAudioBuffer. This gives ~3 gRPC calls/sec instead of
+// 50 (one per RTP packet) and keeps decode diagnostics once-per-batch.
+func decodeOpusLoop(session *Session, opusBackend grpc.Backend, done chan struct{}) {
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			session.OpusFramesLock.Lock()
+			frames := session.OpusFrames
+			session.OpusFrames = nil
+			session.OpusFramesLock.Unlock()
+			if len(frames) == 0 {
+				continue
+			}
+
+			result, err := opusBackend.AudioDecode(context.Background(), &proto.AudioDecodeRequest{
+				Frames: frames,
+				Options: map[string]string{
+					"session_id": session.ID,
+				},
+			})
+			if err != nil {
+				xlog.Warn("opus decode batch error", "error", err, "frames", len(frames))
+				continue
+			}
+
+			samples := sound.BytesToInt16sLE(result.PcmData)
+
+			xlog.Debug("opus decode batch",
+				"frames", len(frames),
+				"decoded_samples", len(samples),
+				"sample_rate", result.SampleRate,
+			)
+
+			// Resample from 48kHz to session input rate (16kHz) if needed
+			if result.SampleRate != int32(session.InputSampleRate) {
+				samples = sound.ResampleInt16(samples, int(result.SampleRate), session.InputSampleRate)
+			}
+
+			pcmBytes := sound.Int16toBytesLE(samples)
+			session.AudioBufferLock.Lock()
+			newSize := len(session.InputAudioBuffer) + len(pcmBytes)
+			if newSize <= maxAudioBufferSize {
+				session.InputAudioBuffer = append(session.InputAudioBuffer, pcmBytes...)
+			}
+			session.AudioBufferLock.Unlock()
+		case <-done:
+			return
+		}
+	}
 }
 
 // handleVAD is a goroutine that listens for audio data from the client,
 // runs VAD on the audio data, and commits utterances to the conversation
-func handleVAD(cfg *config.ModelConfig, evaluator *templates.Evaluator, session *Session, conv *Conversation, c *websocket.Conn, done chan struct{}) {
+func handleVAD(session *Session, conv *Conversation, t Transport, done chan struct{}) {
 	vadContext, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-done
 		cancel()
 	}()
 
-	silenceThreshold := float64(session.TurnDetection.SilenceDurationMs) / 1000
+	silenceThreshold := 0.5 // Default 500ms
+	if session.TurnDetection != nil && session.TurnDetection.ServerVad != nil {
+		silenceThreshold = float64(session.TurnDetection.ServerVad.SilenceDurationMs) / 1000
+	}
+
 	speechStarted := false
 	startTime := time.Now()
 
@@ -666,40 +1137,31 @@ func handleVAD(cfg *config.ModelConfig, evaluator *templates.Evaluator, session 
 			session.AudioBufferLock.Unlock()
 
 			aints := sound.BytesToInt16sLE(allAudio)
-			if len(aints) == 0 || len(aints) < int(silenceThreshold)*remoteSampleRate {
+			if len(aints) == 0 || len(aints) < int(silenceThreshold*float64(session.InputSampleRate)) {
 				continue
 			}
 
-			// Resample from 24kHz to 16kHz
-			aints = sound.ResampleInt16(aints, remoteSampleRate, localSampleRate)
+			// Resample from InputSampleRate to 16kHz
+			aints = sound.ResampleInt16(aints, session.InputSampleRate, localSampleRate)
 
 			segments, err := runVAD(vadContext, session, aints)
 			if err != nil {
 				if err.Error() == "unexpected speech end" {
-					log.Debug().Msg("VAD cancelled")
+					xlog.Debug("VAD cancelled")
 					continue
 				}
-				log.Error().Msgf("failed to process audio: %s", err.Error())
-				sendError(c, "processing_error", "Failed to process audio: "+err.Error(), "", "")
+				xlog.Error("failed to process audio", "error", err)
+				sendError(t, "processing_error", "Failed to process audio: "+err.Error(), "", "")
 				continue
 			}
 
 			audioLength := float64(len(aints)) / localSampleRate
 
 			// TODO: When resetting the buffer we should retain a small postfix
-			// TODO: The OpenAI documentation seems to suggest that only the client decides when to clear the buffer
 			if len(segments) == 0 && audioLength > silenceThreshold {
 				session.AudioBufferLock.Lock()
 				session.InputAudioBuffer = nil
 				session.AudioBufferLock.Unlock()
-				log.Debug().Msgf("Detected silence for a while, clearing audio buffer")
-
-				sendEvent(c, types.InputAudioBufferClearedEvent{
-					ServerEventBase: types.ServerEventBase{
-						EventID: "event_TODO",
-						Type:    types.ServerEventTypeInputAudioBufferCleared,
-					},
-				})
 
 				continue
 			} else if len(segments) == 0 {
@@ -707,41 +1169,42 @@ func handleVAD(cfg *config.ModelConfig, evaluator *templates.Evaluator, session 
 			}
 
 			if !speechStarted {
-				sendEvent(c, types.InputAudioBufferSpeechStartedEvent{
+				// Barge-in: cancel any in-flight response so we stop
+				// sending audio and don't keep the interrupted reply in history.
+				session.cancelActiveResponse()
+
+				sendEvent(t, types.InputAudioBufferSpeechStartedEvent{
 					ServerEventBase: types.ServerEventBase{
 						EventID: "event_TODO",
-						Type:    types.ServerEventTypeInputAudioBufferSpeechStarted,
 					},
-					AudioStartMs: time.Now().Sub(startTime).Milliseconds(),
+					AudioStartMs: time.Since(startTime).Milliseconds(),
 				})
 				speechStarted = true
 			}
 
 			// Segment still in progress when audio ended
-			segEndTime := segments[len(segments)-1].GetEnd()
+			segEndTime := segments[len(segments)-1].End
 			if segEndTime == 0 {
 				continue
 			}
 
 			if float32(audioLength)-segEndTime > float32(silenceThreshold) {
-				log.Debug().Msgf("Detected end of speech segment")
+				xlog.Debug("Detected end of speech segment")
 				session.AudioBufferLock.Lock()
 				session.InputAudioBuffer = nil
 				session.AudioBufferLock.Unlock()
 
-				sendEvent(c, types.InputAudioBufferSpeechStoppedEvent{
+				sendEvent(t, types.InputAudioBufferSpeechStoppedEvent{
 					ServerEventBase: types.ServerEventBase{
 						EventID: "event_TODO",
-						Type:    types.ServerEventTypeInputAudioBufferSpeechStopped,
 					},
-					AudioEndMs: time.Now().Sub(startTime).Milliseconds(),
+					AudioEndMs: time.Since(startTime).Milliseconds(),
 				})
 				speechStarted = false
 
-				sendEvent(c, types.InputAudioBufferCommittedEvent{
+				sendEvent(t, types.InputAudioBufferCommittedEvent{
 					ServerEventBase: types.ServerEventBase{
 						EventID: "event_TODO",
-						Type:    types.ServerEventTypeInputAudioBufferCommitted,
 					},
 					ItemID:         generateItemID(),
 					PreviousItemID: "TODO",
@@ -749,102 +1212,78 @@ func handleVAD(cfg *config.ModelConfig, evaluator *templates.Evaluator, session 
 
 				abytes := sound.Int16toBytesLE(aints)
 				// TODO: Remove prefix silence that is is over TurnDetectionParams.PrefixPaddingMs
-				go commitUtterance(vadContext, abytes, cfg, evaluator, session, conv, c)
+				respCtx, respDone := session.startResponse(vadContext)
+				go func() {
+					defer close(respDone)
+					commitUtterance(respCtx, abytes, session, conv, t)
+				}()
 			}
 		}
 	}
 }
 
-func commitUtterance(ctx context.Context, utt []byte, cfg *config.ModelConfig, evaluator *templates.Evaluator, session *Session, conv *Conversation, c *websocket.Conn) {
+func commitUtterance(ctx context.Context, utt []byte, session *Session, conv *Conversation, t Transport) {
 	if len(utt) == 0 {
 		return
 	}
 
-	// TODO: If we have a real any-to-any model then transcription is optional
-
 	f, err := os.CreateTemp("", "realtime-audio-chunk-*.wav")
 	if err != nil {
-		log.Error().Msgf("failed to create temp file: %s", err.Error())
+		xlog.Error("failed to create temp file", "error", err)
 		return
 	}
 	defer f.Close()
 	defer os.Remove(f.Name())
-	log.Debug().Msgf("Writing to %s\n", f.Name())
+	xlog.Debug("Writing to file", "file", f.Name())
 
 	hdr := laudio.NewWAVHeader(uint32(len(utt)))
 	if err := hdr.Write(f); err != nil {
-		log.Error().Msgf("Failed to write WAV header: %s", err.Error())
+		xlog.Error("Failed to write WAV header", "error", err)
 		return
 	}
 
 	if _, err := f.Write(utt); err != nil {
-		log.Error().Msgf("Failed to write audio data: %s", err.Error())
+		xlog.Error("Failed to write audio data", "error", err)
 		return
 	}
 
 	f.Sync()
 
+	// TODO: If we have a real any-to-any model then transcription is optional
+	var transcript string
 	if session.InputAudioTranscription != nil {
-		tr, err := session.ModelInterface.Transcribe(ctx, &proto.TranscriptRequest{
-			Dst:       f.Name(),
-			Language:  session.InputAudioTranscription.Language,
-			Translate: false,
-			Threads:   uint32(*cfg.Threads),
-		})
+		tr, err := session.ModelInterface.Transcribe(ctx, f.Name(), session.InputAudioTranscription.Language, false, false, session.InputAudioTranscription.Prompt)
 		if err != nil {
-			sendError(c, "transcription_failed", err.Error(), "", "event_TODO")
+			sendError(t, "transcription_failed", err.Error(), "", "event_TODO")
+			return
+		} else if tr == nil {
+			sendError(t, "transcription_failed", "trancribe result is nil", "", "event_TODO")
+			return
 		}
 
-		sendEvent(c, types.ResponseAudioTranscriptDoneEvent{
+		transcript = tr.Text
+		sendEvent(t, types.ConversationItemInputAudioTranscriptionCompletedEvent{
 			ServerEventBase: types.ServerEventBase{
-				Type:    types.ServerEventTypeResponseAudioTranscriptDone,
 				EventID: "event_TODO",
 			},
 
-			ItemID:       generateItemID(),
-			ResponseID:   "resp_TODO",
-			OutputIndex:  0,
+			ItemID: generateItemID(),
+			// ResponseID:   "resp_TODO", // Not needed for transcription completed event
+			// OutputIndex:  0,
 			ContentIndex: 0,
-			Transcript:   tr.GetText(),
+			Transcript:   transcript,
 		})
-		// TODO: Update the prompt with transcription result?
+	} else {
+		sendNotImplemented(t, "any-to-any models")
+		return
 	}
 
 	if !session.TranscriptionOnly {
-		sendNotImplemented(c, "Commiting items to the conversation not implemented")
+		generateResponse(ctx, session, utt, transcript, conv, t)
 	}
-
-	// TODO: Commit the audio and/or transcribed text to the conversation
-	// Commit logic: create item, broadcast item.created, etc.
-	// item := &Item{
-	// 	ID:     generateItemID(),
-	// 	Object: "realtime.item",
-	// 	Type:   "message",
-	// 	Status: "completed",
-	// 	Role:   "user",
-	// 	Content: []ConversationContent{
-	// 		{
-	// 			Type:  "input_audio",
-	// 			Audio: base64.StdEncoding.EncodeToString(utt),
-	// 		},
-	// 	},
-	// }
-	// conv.Lock.Lock()
-	// conv.Items = append(conv.Items, item)
-	// conv.Lock.Unlock()
-	//
-	//
-	// sendEvent(c, OutgoingMessage{
-	// 	Type: "conversation.item.created",
-	// 	Item: item,
-	// })
-	//
-	//
-	// // trigger the response generation
-	// generateResponse(cfg, evaluator, session, conv, ResponseCreate{}, c, websocket.TextMessage)
 }
 
-func runVAD(ctx context.Context, session *Session, adata []int16) ([]*proto.VADSegment, error) {
+func runVAD(ctx context.Context, session *Session, adata []int16) ([]schema.VADSegment, error) {
 	soundIntBuffer := &audio.IntBuffer{
 		Format:         &audio.Format{SampleRate: localSampleRate, NumChannels: 1},
 		SourceBitDepth: 16,
@@ -853,7 +1292,7 @@ func runVAD(ctx context.Context, session *Session, adata []int16) ([]*proto.VADS
 
 	float32Data := soundIntBuffer.AsFloat32Buffer().Data
 
-	resp, err := session.ModelInterface.VAD(ctx, &proto.VADRequest{
+	resp, err := session.ModelInterface.VAD(ctx, &schema.VADRequest{
 		Audio: float32Data,
 	})
 	if err != nil {
@@ -864,406 +1303,675 @@ func runVAD(ctx context.Context, session *Session, adata []int16) ([]*proto.VADS
 	return resp.Segments, nil
 }
 
-// TODO: Below needed for normal mode instead of transcription only
 // Function to generate a response based on the conversation
-// func generateResponse(config *config.ModelConfig, evaluator *templates.Evaluator, session *Session, conversation *Conversation, responseCreate ResponseCreate, c *websocket.Conn, mt int) {
-//
-// 	log.Debug().Msg("Generating realtime response...")
-//
-// 	// Compile the conversation history
-// 	conversation.Lock.Lock()
-// 	var conversationHistory []schema.Message
-// 	var latestUserAudio string
-// 	for _, item := range conversation.Items {
-// 		for _, content := range item.Content {
-// 			switch content.Type {
-// 			case "input_text", "text":
-// 				conversationHistory = append(conversationHistory, schema.Message{
-// 					Role:          string(item.Role),
-// 					StringContent: content.Text,
-// 					Content:       content.Text,
-// 				})
-// 			case "input_audio":
-// 				// We do not to turn to text here the audio result.
-// 				// When generating it later on from the LLM,
-// 				// we will also generate text and return it and store it in the conversation
-// 				// Here we just want to get the user audio if there is any as a new input for the conversation.
-// 				if item.Role == "user" {
-// 					latestUserAudio = content.Audio
-// 				}
-// 			}
-// 		}
-// 	}
-//
-// 	conversation.Lock.Unlock()
-//
-// 	var generatedText string
-// 	var generatedAudio []byte
-// 	var functionCall *FunctionCall
-// 	var err error
-//
-// 	if latestUserAudio != "" {
-// 		// Process the latest user audio input
-// 		decodedAudio, err := base64.StdEncoding.DecodeString(latestUserAudio)
-// 		if err != nil {
-// 			log.Error().Msgf("failed to decode latest user audio: %s", err.Error())
-// 			sendError(c, "invalid_audio_data", "Failed to decode audio data", "", "")
-// 			return
-// 		}
-//
-// 		// Process the audio input and generate a response
-// 		generatedText, generatedAudio, functionCall, err = processAudioResponse(session, decodedAudio)
-// 		if err != nil {
-// 			log.Error().Msgf("failed to process audio response: %s", err.Error())
-// 			sendError(c, "processing_error", "Failed to generate audio response", "", "")
-// 			return
-// 		}
-// 	} else {
-//
-// 		if session.Instructions != "" {
-// 			conversationHistory = append([]schema.Message{{
-// 				Role:          "system",
-// 				StringContent: session.Instructions,
-// 				Content:       session.Instructions,
-// 			}}, conversationHistory...)
-// 		}
-//
-// 		funcs := session.Functions
-// 		shouldUseFn := len(funcs) > 0 && config.ShouldUseFunctions()
-//
-// 		// Allow the user to set custom actions via config file
-// 		// to be "embedded" in each model
-// 		noActionName := "answer"
-// 		noActionDescription := "use this action to answer without performing any action"
-//
-// 		if config.FunctionsConfig.NoActionFunctionName != "" {
-// 			noActionName = config.FunctionsConfig.NoActionFunctionName
-// 		}
-// 		if config.FunctionsConfig.NoActionDescriptionName != "" {
-// 			noActionDescription = config.FunctionsConfig.NoActionDescriptionName
-// 		}
-//
-// 		if (!config.FunctionsConfig.GrammarConfig.NoGrammar) && shouldUseFn {
-// 			noActionGrammar := functions.Function{
-// 				Name:        noActionName,
-// 				Description: noActionDescription,
-// 				Parameters: map[string]interface{}{
-// 					"properties": map[string]interface{}{
-// 						"message": map[string]interface{}{
-// 							"type":        "string",
-// 							"description": "The message to reply the user with",
-// 						}},
-// 				},
-// 			}
-//
-// 			// Append the no action function
-// 			if !config.FunctionsConfig.DisableNoAction {
-// 				funcs = append(funcs, noActionGrammar)
-// 			}
-//
-// 			// Update input grammar
-// 			jsStruct := funcs.ToJSONStructure(config.FunctionsConfig.FunctionNameKey, config.FunctionsConfig.FunctionNameKey)
-// 			g, err := jsStruct.Grammar(config.FunctionsConfig.GrammarOptions()...)
-// 			if err == nil {
-// 				config.Grammar = g
-// 			}
-// 		}
-//
-// 		// Generate a response based on text conversation history
-// 		prompt := evaluator.TemplateMessages(conversationHistory, config, funcs, shouldUseFn)
-//
-// 		generatedText, functionCall, err = processTextResponse(config, session, prompt)
-// 		if err != nil {
-// 			log.Error().Msgf("failed to process text response: %s", err.Error())
-// 			sendError(c, "processing_error", "Failed to generate text response", "", "")
-// 			return
-// 		}
-// 		log.Debug().Any("text", generatedText).Msg("Generated text response")
-// 	}
-//
-// 	if functionCall != nil {
-// 		// The model wants to call a function
-// 		// Create a function_call item and send it to the client
-// 		item := &Item{
-// 			ID:           generateItemID(),
-// 			Object:       "realtime.item",
-// 			Type:         "function_call",
-// 			Status:       "completed",
-// 			Role:         "assistant",
-// 			FunctionCall: functionCall,
-// 		}
-//
-// 		// Add item to conversation
-// 		conversation.Lock.Lock()
-// 		conversation.Items = append(conversation.Items, item)
-// 		conversation.Lock.Unlock()
-//
-// 		// Send item.created event
-// 		sendEvent(c, OutgoingMessage{
-// 			Type: "conversation.item.created",
-// 			Item: item,
-// 		})
-//
-// 		// Optionally, you can generate a message to the user indicating the function call
-// 		// For now, we'll assume the client handles the function call and may trigger another response
-//
-// 	} else {
-// 		// Send response.stream messages
-// 		if generatedAudio != nil {
-// 			// If generatedAudio is available, send it as audio
-// 			encodedAudio := base64.StdEncoding.EncodeToString(generatedAudio)
-// 			outgoingMsg := OutgoingMessage{
-// 				Type:  "response.stream",
-// 				Audio: encodedAudio,
-// 			}
-// 			sendEvent(c, outgoingMsg)
-// 		} else {
-// 			// Send text response (could be streamed in chunks)
-// 			chunks := splitResponseIntoChunks(generatedText)
-// 			for _, chunk := range chunks {
-// 				outgoingMsg := OutgoingMessage{
-// 					Type:    "response.stream",
-// 					Content: chunk,
-// 				}
-// 				sendEvent(c, outgoingMsg)
-// 			}
-// 		}
-//
-// 		// Send response.done message
-// 		sendEvent(c, OutgoingMessage{
-// 			Type: "response.done",
-// 		})
-//
-// 		// Add the assistant's response to the conversation
-// 		content := []ConversationContent{}
-// 		if generatedAudio != nil {
-// 			content = append(content, ConversationContent{
-// 				Type:  "audio",
-// 				Audio: base64.StdEncoding.EncodeToString(generatedAudio),
-// 			})
-// 			// Optionally include a text transcript
-// 			if generatedText != "" {
-// 				content = append(content, ConversationContent{
-// 					Type: "text",
-// 					Text: generatedText,
-// 				})
-// 			}
-// 		} else {
-// 			content = append(content, ConversationContent{
-// 				Type: "text",
-// 				Text: generatedText,
-// 			})
-// 		}
-//
-// 		item := &Item{
-// 			ID:      generateItemID(),
-// 			Object:  "realtime.item",
-// 			Type:    "message",
-// 			Status:  "completed",
-// 			Role:    "assistant",
-// 			Content: content,
-// 		}
-//
-// 		// Add item to conversation
-// 		conversation.Lock.Lock()
-// 		conversation.Items = append(conversation.Items, item)
-// 		conversation.Lock.Unlock()
-//
-// 		// Send item.created event
-// 		sendEvent(c, OutgoingMessage{
-// 			Type: "conversation.item.created",
-// 			Item: item,
-// 		})
-//
-// 		log.Debug().Any("item", item).Msg("Realtime response sent")
-// 	}
-// }
+func generateResponse(ctx context.Context, session *Session, utt []byte, transcript string, conv *Conversation, t Transport) {
+	xlog.Debug("Generating realtime response...")
 
-// Function to process text response and detect function calls
-func processTextResponse(config *config.ModelConfig, session *Session, prompt string) (string, *FunctionCall, error) {
+	// Create user message item
+	item := types.MessageItemUnion{
+		User: &types.MessageItemUser{
+			ID:     generateItemID(),
+			Status: types.ItemStatusCompleted,
+			Content: []types.MessageContentInput{
+				{
+					Type:       types.MessageContentTypeInputAudio,
+					Audio:      base64.StdEncoding.EncodeToString(utt),
+					Transcript: transcript,
+				},
+			},
+		},
+	}
+	conv.Lock.Lock()
+	conv.Items = append(conv.Items, &item)
+	conv.Lock.Unlock()
 
-	// Placeholder implementation
-	// Replace this with actual model inference logic using session.Model and prompt
-	// For example, the model might return a special token or JSON indicating a function call
+	sendEvent(t, types.ConversationItemAddedEvent{
+		Item: item,
+	})
 
-	/*
-		predFunc, err := backend.ModelInference(context.Background(), prompt, input.Messages, images, videos, audios, ml, *config, o, nil, "", "", nil, nil, nil)
+	triggerResponse(ctx, session, conv, t, nil)
+}
 
-		result, tokenUsage, err := ComputeChoices(input, prompt, config, startupOptions, ml, func(s string, c *[]schema.Choice) {
-			if !shouldUseFn {
-				// no function is called, just reply and use stop as finish reason
-				stopReason := FinishReasonStop
-				*c = append(*c, schema.Choice{FinishReason: &stopReason, Index: 0, Message: &schema.Message{Role: "assistant", Content: &s}})
+// maxAssistantToolTurns caps the server-side agentic loop. Mirrors the
+// chat-page maxToolTurns:10 from useChat.js — the model gets up to this
+// many consecutive tool round-trips before we return control to the user
+// without another response cycle.
+const maxAssistantToolTurns = 10
+
+func triggerResponse(ctx context.Context, session *Session, conv *Conversation, t Transport, overrides *types.ResponseCreateParams) {
+	triggerResponseAtTurn(ctx, session, conv, t, overrides, 0)
+}
+
+func triggerResponseAtTurn(ctx context.Context, session *Session, conv *Conversation, t Transport, overrides *types.ResponseCreateParams, toolTurn int) {
+	config := session.ModelInterface.PredictConfig()
+
+	// Default values
+	tools := session.Tools
+	toolChoice := session.ToolChoice
+	instructions := session.Instructions
+	maxOutputTokens := session.MaxOutputTokens
+	// Overrides
+	if overrides != nil {
+		if overrides.Tools != nil {
+			tools = overrides.Tools
+		}
+		if overrides.ToolChoice != nil {
+			toolChoice = overrides.ToolChoice
+		}
+		if overrides.Instructions != "" {
+			instructions = overrides.Instructions
+		}
+		if overrides.MaxOutputTokens != 0 {
+			maxOutputTokens = overrides.MaxOutputTokens
+		}
+	}
+
+	// Apply MaxOutputTokens to model config if specified
+	// Save original value to restore after prediction
+	var originalMaxTokens *int
+	if config != nil {
+		originalMaxTokens = config.Maxtokens
+		if maxOutputTokens != 0 && !maxOutputTokens.IsInf() {
+			tokenValue := int(maxOutputTokens)
+			config.Maxtokens = &tokenValue
+			xlog.Debug("Applied max_output_tokens to config", "value", tokenValue)
+		}
+	}
+	// Defer restoration of original value
+	defer func() {
+		if config != nil {
+			config.Maxtokens = originalMaxTokens
+		}
+	}()
+
+	var conversationHistory schema.Messages
+	conversationHistory = append(conversationHistory, schema.Message{
+		Role:          string(types.MessageRoleSystem),
+		StringContent: instructions,
+		Content:       instructions,
+	})
+
+	imgIndex := 0
+	conv.Lock.Lock()
+	items := trimRealtimeItems(conv.Items, session.MaxHistoryItems)
+	for _, item := range items {
+		if item.User != nil {
+			msg := schema.Message{
+				Role: string(types.MessageRoleUser),
+			}
+			textContent := ""
+			nrOfImgsInMessage := 0
+			for _, content := range item.User.Content {
+				switch content.Type {
+				case types.MessageContentTypeInputText:
+					textContent += content.Text
+				case types.MessageContentTypeInputAudio:
+					textContent += content.Transcript
+				case types.MessageContentTypeInputImage:
+					img, err := utils.GetContentURIAsBase64(content.ImageURL)
+					if err != nil {
+						xlog.Warn("Failed to process image", "error", err)
+						continue
+					}
+					msg.StringImages = append(msg.StringImages, img)
+					imgIndex++
+					nrOfImgsInMessage++
+				}
+			}
+			if nrOfImgsInMessage > 0 && !config.TemplateConfig.UseTokenizerTemplate {
+				templated, err := templates.TemplateMultiModal(config.TemplateConfig.Multimodal, templates.MultiModalOptions{
+					TotalImages:     imgIndex,
+					ImagesInMessage: nrOfImgsInMessage,
+				}, textContent)
+				if err != nil {
+					xlog.Warn("Failed to apply multimodal template", "error", err)
+					templated = textContent
+				}
+				msg.StringContent = templated
+				msg.Content = templated
+			} else {
+				msg.StringContent = textContent
+				msg.Content = textContent
+			}
+			conversationHistory = append(conversationHistory, msg)
+		} else if item.Assistant != nil {
+			for _, content := range item.Assistant.Content {
+				switch content.Type {
+				case types.MessageContentTypeOutputText:
+					conversationHistory = append(conversationHistory, schema.Message{
+						Role:          string(types.MessageRoleAssistant),
+						StringContent: content.Text,
+						Content:       content.Text,
+					})
+				case types.MessageContentTypeOutputAudio:
+					conversationHistory = append(conversationHistory, schema.Message{
+						Role:          string(types.MessageRoleAssistant),
+						StringContent: content.Transcript,
+						Content:       content.Transcript,
+						StringAudios:  []string{content.Audio},
+					})
+				}
+			}
+		} else if item.System != nil {
+			for _, content := range item.System.Content {
+				conversationHistory = append(conversationHistory, schema.Message{
+					Role:          string(types.MessageRoleSystem),
+					StringContent: content.Text,
+					Content:       content.Text,
+				})
+			}
+		} else if item.FunctionCall != nil {
+			conversationHistory = append(conversationHistory, schema.Message{
+				Role: string(types.MessageRoleAssistant),
+				ToolCalls: []schema.ToolCall{
+					{
+						ID:   item.FunctionCall.CallID,
+						Type: "function",
+						FunctionCall: schema.FunctionCall{
+							Name:      item.FunctionCall.Name,
+							Arguments: item.FunctionCall.Arguments,
+						},
+					},
+				},
+			})
+		} else if item.FunctionCallOutput != nil {
+			conversationHistory = append(conversationHistory, schema.Message{
+				Role:          "tool",
+				Name:          item.FunctionCallOutput.CallID,
+				Content:       item.FunctionCallOutput.Output,
+				StringContent: item.FunctionCallOutput.Output,
+			})
+		}
+	}
+	conv.Lock.Unlock()
+
+	var images []string
+	for _, m := range conversationHistory {
+		images = append(images, m.StringImages...)
+	}
+
+	responseID := generateUniqueID()
+	sendEvent(t, types.ResponseCreatedEvent{
+		ServerEventBase: types.ServerEventBase{},
+		Response: types.Response{
+			ID:     responseID,
+			Object: "realtime.response",
+			Status: types.ResponseStatusInProgress,
+		},
+	})
+
+	predFunc, err := session.ModelInterface.Predict(ctx, conversationHistory, images, nil, nil, nil, tools, toolChoice, nil, nil, nil)
+	if err != nil {
+		sendError(t, "inference_failed", fmt.Sprintf("backend error: %v", err), "", "") // item.Assistant.ID is unknown here
+		return
+	}
+
+	pred, err := predFunc()
+	if err != nil {
+		sendError(t, "prediction_failed", fmt.Sprintf("backend error: %v", err), "", "")
+		return
+	}
+
+	// Check for cancellation after LLM inference (barge-in may have fired)
+	if ctx.Err() != nil {
+		xlog.Debug("Response cancelled after LLM inference (barge-in)")
+		sendEvent(t, types.ResponseDoneEvent{
+			ServerEventBase: types.ServerEventBase{},
+			Response: types.Response{
+				ID:     responseID,
+				Object: "realtime.response",
+				Status: types.ResponseStatusCancelled,
+			},
+		})
+		return
+	}
+
+	xlog.Debug("Function config for parsing", "function_name_key", config.FunctionsConfig.FunctionNameKey, "function_arguments_key", config.FunctionsConfig.FunctionArgumentsKey)
+	xlog.Debug("LLM raw response", "text", pred.Response, "response_length", len(pred.Response), "usage", pred.Usage)
+
+	// Safely dereference pointer fields for logging
+	maxTokens := "nil"
+	if config.Maxtokens != nil {
+		maxTokens = fmt.Sprintf("%d", *config.Maxtokens)
+	}
+	contextSize := "nil"
+	if config.ContextSize != nil {
+		contextSize = fmt.Sprintf("%d", *config.ContextSize)
+	}
+	xlog.Debug("Model parameters", "max_tokens", maxTokens, "context_size", contextSize, "stopwords", config.StopWords)
+
+	rawResponse := pred.Response
+	if config.TemplateConfig.ReplyPrefix != "" {
+		rawResponse = config.TemplateConfig.ReplyPrefix + rawResponse
+	}
+
+	// Detect thinking start token from template for reasoning extraction
+	var template string
+	if config.TemplateConfig.UseTokenizerTemplate {
+		template = config.GetModelTemplate()
+	} else {
+		template = config.TemplateConfig.Chat
+	}
+	thinkingStartToken := reasoning.DetectThinkingStartToken(template, &config.ReasoningConfig)
+
+	// When the C++ autoparser emitted ChatDeltas with actionable data,
+	// prefer them — the backend clears Reply.Message in that path and
+	// delivers parsed content/reasoning/tool-calls via the delta stream
+	// (see pkg/functions/chat_deltas.go, mirrored from chat.go's non-SSE
+	// handling). Without this, Response is empty and realtime would
+	// synthesize silence for replies that actually produced tokens.
+	var reasoningText, responseWithoutReasoning, textContent, cleanedResponse string
+	var toolCalls []functions.FuncCallResults
+	deltaToolCalls := functions.ToolCallsFromChatDeltas(pred.ChatDeltas)
+	deltaContent := functions.ContentFromChatDeltas(pred.ChatDeltas)
+	deltaReasoning := functions.ReasoningFromChatDeltas(pred.ChatDeltas)
+	if len(deltaToolCalls) > 0 || deltaContent != "" {
+		xlog.Debug("[ChatDeltas] realtime: using C++ autoparser deltas",
+			"tool_calls", len(deltaToolCalls),
+			"content_len", len(deltaContent),
+			"reasoning_len", len(deltaReasoning))
+		reasoningText = deltaReasoning
+		responseWithoutReasoning = deltaContent
+		textContent = deltaContent
+		cleanedResponse = deltaContent
+		toolCalls = deltaToolCalls
+	} else {
+		reasoningText, responseWithoutReasoning = reasoning.ExtractReasoningWithConfig(rawResponse, thinkingStartToken, config.ReasoningConfig)
+		textContent = functions.ParseTextContent(responseWithoutReasoning, config.FunctionsConfig)
+		cleanedResponse = functions.CleanupLLMResult(responseWithoutReasoning, config.FunctionsConfig)
+		toolCalls = functions.ParseFunctionCall(cleanedResponse, config.FunctionsConfig)
+	}
+	xlog.Debug("LLM Response", "reasoning", reasoningText, "response_without_reasoning", responseWithoutReasoning)
+
+	xlog.Debug("Function call parsing", "textContent", textContent, "cleanedResponse", cleanedResponse, "toolCallsCount", len(toolCalls))
+
+	noActionName := "answer"
+	if config.FunctionsConfig.NoActionFunctionName != "" {
+		noActionName = config.FunctionsConfig.NoActionFunctionName
+	}
+	isNoAction := len(toolCalls) > 0 && toolCalls[0].Name == noActionName
+
+	var finalSpeech string
+	var finalToolCalls []functions.FuncCallResults
+
+	if isNoAction {
+		arg := toolCalls[0].Arguments
+		arguments := map[string]any{}
+		if err := json.Unmarshal([]byte(arg), &arguments); err == nil {
+			if m, exists := arguments["message"]; exists {
+				if message, ok := m.(string); ok {
+					finalSpeech = message
+				} else {
+					xlog.Warn("NoAction function message field is not a string", "type", fmt.Sprintf("%T", m))
+				}
+			} else {
+				xlog.Warn("NoAction function missing 'message' field in arguments")
+			}
+		} else {
+			xlog.Warn("Failed to unmarshal NoAction function arguments", "error", err, "arguments", arg)
+		}
+		if finalSpeech == "" {
+			// Fallback if parsing failed
+			xlog.Warn("NoAction function did not produce speech, using cleaned response as fallback")
+			finalSpeech = cleanedResponse
+		}
+	} else {
+		finalToolCalls = toolCalls
+		xlog.Debug("Setting finalToolCalls", "count", len(finalToolCalls))
+		if len(toolCalls) > 0 {
+			finalSpeech = textContent
+		} else {
+			finalSpeech = cleanedResponse
+		}
+	}
+
+	if finalSpeech != "" {
+		// Create the assistant item now that we have content
+		item := types.MessageItemUnion{
+			Assistant: &types.MessageItemAssistant{
+				ID:     generateItemID(),
+				Status: types.ItemStatusInProgress,
+				Content: []types.MessageContentOutput{
+					{
+						Type:       types.MessageContentTypeOutputAudio,
+						Transcript: finalSpeech,
+					},
+				},
+			},
+		}
+
+		conv.Lock.Lock()
+		conv.Items = append(conv.Items, &item)
+		conv.Lock.Unlock()
+
+		sendEvent(t, types.ResponseOutputItemAddedEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			OutputIndex:     0,
+			Item:            item,
+		})
+
+		sendEvent(t, types.ResponseContentPartAddedEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			ItemID:          item.Assistant.ID,
+			OutputIndex:     0,
+			ContentIndex:    0,
+			Part:            item.Assistant.Content[0],
+		})
+
+		// removeItemFromConv removes the last occurrence of an item with
+		// the given assistant ID from conversation history.
+		removeItemFromConv := func(assistantID string) {
+			conv.Lock.Lock()
+			for i := len(conv.Items) - 1; i >= 0; i-- {
+				if conv.Items[i].Assistant != nil && conv.Items[i].Assistant.ID == assistantID {
+					conv.Items = append(conv.Items[:i], conv.Items[i+1:]...)
+					break
+				}
+			}
+			conv.Lock.Unlock()
+		}
+
+		// sendCancelledResponse emits the cancelled status and cleans up the
+		// assistant item so the interrupted reply is not in chat history.
+		sendCancelledResponse := func() {
+			removeItemFromConv(item.Assistant.ID)
+			sendEvent(t, types.ResponseDoneEvent{
+				ServerEventBase: types.ServerEventBase{},
+				Response: types.Response{
+					ID:     responseID,
+					Object: "realtime.response",
+					Status: types.ResponseStatusCancelled,
+				},
+			})
+		}
+
+		var audioString string
+		_, isWebRTC := t.(*WebRTCTransport)
+		var respMods []types.Modality
+		if overrides != nil {
+			respMods = overrides.OutputModalities
+		}
+		modalities := resolveOutputModalities(session.OutputModalities, respMods)
+		if modalitiesContainAudio(modalities) {
+			// Check for cancellation before TTS
+			if ctx.Err() != nil {
+				xlog.Debug("Response cancelled before TTS (barge-in)")
+				sendCancelledResponse()
 				return
 			}
 
-			textContentToReturn = functions.ParseTextContent(s, config.FunctionsConfig)
-			s = functions.CleanupLLMResult(s, config.FunctionsConfig)
-			results := functions.ParseFunctionCall(s, config.FunctionsConfig)
-			log.Debug().Msgf("Text content to return: %s", textContentToReturn)
-			noActionsToRun := len(results) > 0 && results[0].Name == noActionName || len(results) == 0
-
-			switch {
-			case noActionsToRun:
-				result, err := handleQuestion(config, input, ml, startupOptions, results, s, predInput)
-				if err != nil {
-					log.Error().Err(err).Msg("error handling question")
+			audioFilePath, res, err := session.ModelInterface.TTS(ctx, finalSpeech, session.Voice, session.InputAudioTranscription.Language)
+			if err != nil {
+				if ctx.Err() != nil {
+					xlog.Debug("TTS cancelled (barge-in)")
+					sendCancelledResponse()
 					return
 				}
-				*c = append(*c, schema.Choice{
-					Message: &schema.Message{Role: "assistant", Content: &result}})
-			default:
-				toolChoice := schema.Choice{
-					Message: &schema.Message{
-						Role: "assistant",
-					},
-				}
+				xlog.Error("TTS failed", "error", err)
+				sendError(t, "tts_error", fmt.Sprintf("TTS generation failed: %v", err), "", item.Assistant.ID)
+				return
+			}
+			if !res.Success {
+				xlog.Error("TTS failed", "message", res.Message)
+				sendError(t, "tts_error", fmt.Sprintf("TTS generation failed: %s", res.Message), "", item.Assistant.ID)
+				return
+			}
+			defer func() { _ = os.Remove(audioFilePath) }()
 
-				if len(input.Tools) > 0 {
-					toolCallsReason := FinishReasonToolCalls
-					toolChoice.FinishReason = &toolCallsReason
-				}
-
-				for _, ss := range results {
-					name, args := ss.Name, ss.Arguments
-					if len(input.Tools) > 0 {
-						// If we are using tools, we condense the function calls into
-						// a single response choice with all the tools
-						toolChoice.Message.Content = textContentToReturn
-						toolChoice.Message.ToolCalls = append(toolChoice.Message.ToolCalls,
-							schema.ToolCall{
-								ID:   id,
-								Type: "function",
-								FunctionCall: schema.FunctionCall{
-									Name:      name,
-									Arguments: args,
-								},
-							},
-						)
-					} else {
-						// otherwise we return more choices directly
-						functionCallReason := FinishReasonFunctionCall
-						*c = append(*c, schema.Choice{
-							FinishReason: &functionCallReason,
-							Message: &schema.Message{
-								Role:    "assistant",
-								Content: &textContentToReturn,
-								FunctionCall: map[string]interface{}{
-									"name":      name,
-									"arguments": args,
-								},
-							},
-						})
-					}
-				}
-
-				if len(input.Tools) > 0 {
-					// we need to append our result if we are using tools
-					*c = append(*c, toolChoice)
-				}
+			audioBytes, err := os.ReadFile(audioFilePath)
+			if err != nil {
+				xlog.Error("failed to read TTS file", "error", err)
+				sendError(t, "tts_error", fmt.Sprintf("Failed to read TTS audio: %v", err), "", item.Assistant.ID)
+				return
 			}
 
-		}, nil)
-		if err != nil {
-			return err
+			// Parse WAV header to get raw PCM and the actual sample rate from the TTS backend.
+			pcmData, ttsSampleRate := laudio.ParseWAV(audioBytes)
+			if ttsSampleRate == 0 {
+				ttsSampleRate = localSampleRate
+			}
+			xlog.Debug("TTS audio parsed", "raw_bytes", len(audioBytes), "pcm_bytes", len(pcmData), "sample_rate", ttsSampleRate)
+
+			// SendAudio (WebRTC) passes PCM at the TTS sample rate directly to the
+			// Opus encoder, which resamples to 48kHz internally. This avoids a
+			// lossy intermediate resample through 16kHz.
+			// XXX: This is a noop in websocket mode; it's included in the JSON instead
+			if err := t.SendAudio(ctx, pcmData, ttsSampleRate); err != nil {
+				if ctx.Err() != nil {
+					xlog.Debug("Audio playback cancelled (barge-in)")
+					sendCancelledResponse()
+					return
+				}
+				xlog.Error("failed to send audio via transport", "error", err)
+			}
+
+			// For WebSocket clients, resample to the session's output rate and
+			// deliver audio as base64 in JSON events. WebRTC clients already
+			// received audio over the RTP track, so skip the base64 payload.
+			if !isWebRTC {
+				wsPCM := pcmData
+				if ttsSampleRate != session.OutputSampleRate {
+					samples := sound.BytesToInt16sLE(pcmData)
+					resampled := sound.ResampleInt16(samples, ttsSampleRate, session.OutputSampleRate)
+					wsPCM = sound.Int16toBytesLE(resampled)
+				}
+				audioString = base64.StdEncoding.EncodeToString(wsPCM)
+			}
+
+			sendEvent(t, types.ResponseOutputAudioTranscriptDeltaEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ResponseID:      responseID,
+				ItemID:          item.Assistant.ID,
+				OutputIndex:     0,
+				ContentIndex:    0,
+				Delta:           finalSpeech,
+			})
+			sendEvent(t, types.ResponseOutputAudioTranscriptDoneEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ResponseID:      responseID,
+				ItemID:          item.Assistant.ID,
+				OutputIndex:     0,
+				ContentIndex:    0,
+				Transcript:      finalSpeech,
+			})
+
+			if !isWebRTC {
+				sendEvent(t, types.ResponseOutputAudioDeltaEvent{
+					ServerEventBase: types.ServerEventBase{},
+					ResponseID:      responseID,
+					ItemID:          item.Assistant.ID,
+					OutputIndex:     0,
+					ContentIndex:    0,
+					Delta:           audioString,
+				})
+				sendEvent(t, types.ResponseOutputAudioDoneEvent{
+					ServerEventBase: types.ServerEventBase{},
+					ResponseID:      responseID,
+					ItemID:          item.Assistant.ID,
+					OutputIndex:     0,
+					ContentIndex:    0,
+				})
+			}
+		} else {
+			// Text-only mode: skip TTS, emit only the text events.
+			sendEvent(t, types.ResponseOutputTextDeltaEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ResponseID:      responseID,
+				ItemID:          item.Assistant.ID,
+				OutputIndex:     0,
+				ContentIndex:    0,
+				Delta:           finalSpeech,
+			})
+			sendEvent(t, types.ResponseOutputTextDoneEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ResponseID:      responseID,
+				ItemID:          item.Assistant.ID,
+				OutputIndex:     0,
+				ContentIndex:    0,
+				Text:            finalSpeech,
+			})
 		}
 
-		resp := &schema.OpenAIResponse{
-			ID:      id,
-			Created: created,
-			Model:   input.Model, // we have to return what the user sent here, due to OpenAI spec.
-			Choices: result,
-			Object:  "chat.completion",
-			Usage: schema.OpenAIUsage{
-				PromptTokens:     tokenUsage.Prompt,
-				CompletionTokens: tokenUsage.Completion,
-				TotalTokens:      tokenUsage.Prompt + tokenUsage.Completion,
-			},
+		sendEvent(t, types.ResponseContentPartDoneEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			ItemID:          item.Assistant.ID,
+			OutputIndex:     0,
+			ContentIndex:    0,
+			Part:            item.Assistant.Content[0],
+		})
+
+		conv.Lock.Lock()
+		item.Assistant.Status = types.ItemStatusCompleted
+		if !isWebRTC {
+			item.Assistant.Content[0].Audio = audioString
 		}
-		respData, _ := json.Marshal(resp)
-		log.Debug().Msgf("Response: %s", respData)
+		conv.Lock.Unlock()
 
-		// Return the prediction in the response body
-		return c.JSON(resp)
-
-	*/
-
-	// TODO: use session.ModelInterface...
-	// Simulate a function call
-	if strings.Contains(prompt, "weather") {
-		functionCall := &FunctionCall{
-			Name: "get_weather",
-			Arguments: map[string]interface{}{
-				"location": "New York",
-				"scale":    "celsius",
-			},
-		}
-		return "", functionCall, nil
+		sendEvent(t, types.ResponseOutputItemDoneEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			OutputIndex:     0,
+			Item:            item,
+		})
 	}
 
-	// Otherwise, return a normal text response
-	return "This is a generated response based on the conversation.", nil, nil
-}
+	// Handle Tool Calls. Two paths:
+	//   - LocalAI Assistant tools (session.AssistantExecutor.IsTool) run
+	//     server-side; we append both the call and its output to conv.Items
+	//     and re-trigger a follow-up response so the model can speak the
+	//     result. The client only sees observability events.
+	//   - All other tools follow the standard OpenAI flow: emit
+	//     function_call_arguments.done and wait for the client to send
+	//     conversation.item.create back.
+	xlog.Debug("About to handle tool calls", "finalToolCallsCount", len(finalToolCalls))
+	executedAssistantTool := false
+	for i, tc := range finalToolCalls {
+		toolCallID := generateItemID()
+		callID := "call_" + generateUniqueID() // OpenAI uses call_xyz
 
-// Function to process audio response and detect function calls
-func processAudioResponse(session *Session, audioData []byte) (string, []byte, *FunctionCall, error) {
-	// TODO: Do the below or use an any-to-any model like Qwen Omni
-	// Implement the actual model inference logic using session.Model and audioData
-	// For example:
-	// 1. Transcribe the audio to text
-	// 2. Generate a response based on the transcribed text
-	// 3. Check if the model wants to call a function
-	// 4. Convert the response text to speech (audio)
-	//
-	// Placeholder implementation:
+		// Create FunctionCall Item
+		fcItem := types.MessageItemUnion{
+			FunctionCall: &types.MessageItemFunctionCall{
+				ID:        toolCallID,
+				CallID:    callID,
+				Name:      tc.Name,
+				Arguments: tc.Arguments,
+				Status:    types.ItemStatusCompleted,
+			},
+		}
 
-	// TODO: template eventual messages, like chat.go
-	reply, err := session.ModelInterface.Predict(context.Background(), &proto.PredictOptions{
-		Prompt: "What's the weather in New York?",
+		conv.Lock.Lock()
+		conv.Items = append(conv.Items, &fcItem)
+		conv.Lock.Unlock()
+
+		outputIndex := i
+		if finalSpeech != "" {
+			outputIndex++
+		}
+
+		sendEvent(t, types.ResponseOutputItemAddedEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			OutputIndex:     outputIndex,
+			Item:            fcItem,
+		})
+
+		serverSide := session.AssistantExecutor != nil && session.AssistantExecutor.IsTool(tc.Name)
+		if serverSide {
+			output, execErr := session.AssistantExecutor.ExecuteTool(ctx, tc.Name, tc.Arguments)
+			if execErr != nil {
+				output = "Error: " + execErr.Error()
+				xlog.Error("realtime: assistant tool execution failed", "tool", tc.Name, "error", execErr)
+			}
+			foItem := types.MessageItemUnion{
+				FunctionCallOutput: &types.MessageItemFunctionCallOutput{
+					ID:     generateItemID(),
+					CallID: callID,
+					Output: output,
+					Status: types.ItemStatusCompleted,
+				},
+			}
+			conv.Lock.Lock()
+			conv.Items = append(conv.Items, &foItem)
+			conv.Lock.Unlock()
+			// Close the call out and emit the output as its own paired
+			// added/done — the OpenAI spec pairs every item-done with a
+			// preceding item-added, so we re-pair here for the output.
+			// The UI renders the transcript entry on item.done for both
+			// shapes (FunctionCall + FunctionCallOutput).
+			sendEvent(t, types.ResponseOutputItemDoneEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ResponseID:      responseID,
+				OutputIndex:     outputIndex,
+				Item:            fcItem,
+			})
+			sendEvent(t, types.ResponseOutputItemAddedEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ResponseID:      responseID,
+				OutputIndex:     outputIndex,
+				Item:            foItem,
+			})
+			sendEvent(t, types.ResponseOutputItemDoneEvent{
+				ServerEventBase: types.ServerEventBase{},
+				ResponseID:      responseID,
+				OutputIndex:     outputIndex,
+				Item:            foItem,
+			})
+			executedAssistantTool = true
+			continue
+		}
+
+		sendEvent(t, types.ResponseFunctionCallArgumentsDeltaEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			ItemID:          toolCallID,
+			OutputIndex:     outputIndex,
+			CallID:          callID,
+			Delta:           tc.Arguments,
+		})
+
+		sendEvent(t, types.ResponseFunctionCallArgumentsDoneEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			ItemID:          toolCallID,
+			OutputIndex:     outputIndex,
+			CallID:          callID,
+			Arguments:       tc.Arguments,
+			Name:            tc.Name,
+		})
+
+		sendEvent(t, types.ResponseOutputItemDoneEvent{
+			ServerEventBase: types.ServerEventBase{},
+			ResponseID:      responseID,
+			OutputIndex:     outputIndex,
+			Item:            fcItem,
+		})
+	}
+
+	sendEvent(t, types.ResponseDoneEvent{
+		ServerEventBase: types.ServerEventBase{},
+		Response: types.Response{
+			ID:     responseID,
+			Object: "realtime.response",
+			Status: types.ResponseStatusCompleted,
+		},
 	})
 
-	if err != nil {
-		return "", nil, nil, err
-	}
-
-	generatedAudio := reply.Audio
-
-	transcribedText := "What's the weather in New York?"
-	var functionCall *FunctionCall
-
-	// Simulate a function call
-	if strings.Contains(transcribedText, "weather") {
-		functionCall = &FunctionCall{
-			Name: "get_weather",
-			Arguments: map[string]interface{}{
-				"location": "New York",
-				"scale":    "celsius",
-			},
+	// If we executed any assistant tools inproc, run another response cycle
+	// so the model can speak the result. Mirrors the chat-side agentic loop
+	// but driven server-side rather than by client round-trip. Bounded so a
+	// degenerate "model keeps calling tools" doesn't blow the stack.
+	if executedAssistantTool {
+		if toolTurn+1 >= maxAssistantToolTurns {
+			xlog.Warn("realtime: assistant tool-turn limit reached, stopping the agentic loop",
+				"limit", maxAssistantToolTurns, "model", session.Model)
+			return
 		}
-		return "", nil, functionCall, nil
+		triggerResponseAtTurn(ctx, session, conv, t, nil, toolTurn+1)
 	}
-
-	// Generate a response
-	generatedText := "This is a response to your speech input."
-
-	return generatedText, generatedAudio, nil, nil
-}
-
-// Function to split the response into chunks (for streaming)
-func splitResponseIntoChunks(response string) []string {
-	// Split the response into chunks of fixed size
-	chunkSize := 50 // characters per chunk
-	var chunks []string
-	for len(response) > 0 {
-		if len(response) > chunkSize {
-			chunks = append(chunks, response[:chunkSize])
-			response = response[chunkSize:]
-		} else {
-			chunks = append(chunks, response)
-			break
-		}
-	}
-	return chunks
 }
 
 // Helper functions to generate unique IDs
@@ -1290,12 +1998,4 @@ func generateUniqueID() string {
 	// For simplicity, use a counter or UUID
 	// Implement as needed
 	return "unique_id"
-}
-
-// Structures for 'response.create' messages
-type ResponseCreate struct {
-	Modalities   []string            `json:"modalities,omitempty"`
-	Instructions string              `json:"instructions,omitempty"`
-	Functions    functions.Functions `json:"functions,omitempty"`
-	// Other fields as needed
 }

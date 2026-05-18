@@ -16,7 +16,7 @@ import (
 	"github.com/mudler/LocalAI/pkg/system"
 	"github.com/mudler/LocalAI/pkg/utils"
 
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 	"gopkg.in/yaml.v3"
 )
 
@@ -77,7 +77,7 @@ func InstallModelFromGallery(
 	modelGalleries, backendGalleries []lconfig.Gallery,
 	systemState *system.SystemState,
 	modelLoader *model.ModelLoader,
-	name string, req GalleryModel, downloadStatus func(string, string, string, float64), enforceScan, automaticallyInstallBackend bool) error {
+	name string, req GalleryModel, downloadStatus func(string, string, string, float64), enforceScan, automaticallyInstallBackend, requireBackendIntegrity bool) error {
 
 	applyModel := func(model *GalleryModel) error {
 		name = strings.ReplaceAll(name, string(os.PathSeparator), "__")
@@ -123,19 +123,21 @@ func InstallModelFromGallery(
 		config.Files = append(config.Files, model.AdditionalFiles...)
 
 		// TODO model.Overrides could be merged with user overrides (not defined yet)
-		if err := mergo.Merge(&model.Overrides, req.Overrides, mergo.WithOverride); err != nil {
-			return err
+		if req.Overrides != nil {
+			if err := mergo.Merge(&model.Overrides, req.Overrides, mergo.WithOverride); err != nil {
+				return err
+			}
 		}
 
 		installedModel, err := InstallModel(ctx, systemState, installName, &config, model.Overrides, downloadStatus, enforceScan)
 		if err != nil {
 			return err
 		}
-		log.Debug().Msgf("Installed model %q", installedModel.Name)
+		xlog.Debug("Installed model", "model", installedModel.Name)
 		if automaticallyInstallBackend && installedModel.Backend != "" {
-			log.Debug().Msgf("Installing backend %q", installedModel.Backend)
+			xlog.Debug("Installing backend", "backend", installedModel.Backend)
 
-			if err := InstallBackendFromGallery(ctx, backendGalleries, systemState, modelLoader, installedModel.Backend, downloadStatus, false); err != nil {
+			if err := InstallBackendFromGallery(ctx, backendGalleries, systemState, modelLoader, installedModel.Backend, downloadStatus, false, requireBackendIntegrity); err != nil {
 				return err
 			}
 		}
@@ -156,7 +158,7 @@ func InstallModelFromGallery(
 	return applyModel(model)
 }
 
-func InstallModel(ctx context.Context, systemState *system.SystemState, nameOverride string, config *ModelConfig, configOverrides map[string]interface{}, downloadStatus func(string, string, string, float64), enforceScan bool) (*lconfig.ModelConfig, error) {
+func InstallModel(ctx context.Context, systemState *system.SystemState, nameOverride string, config *ModelConfig, configOverrides map[string]any, downloadStatus func(string, string, string, float64), enforceScan bool) (*lconfig.ModelConfig, error) {
 	basePath := systemState.Model.ModelsPath
 	// Create base path if it doesn't exist
 	err := os.MkdirAll(basePath, 0750)
@@ -165,7 +167,7 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 	}
 
 	if len(configOverrides) > 0 {
-		log.Debug().Msgf("Config overrides %+v", configOverrides)
+		xlog.Debug("Config overrides", "overrides", configOverrides)
 	}
 
 	// Download files and verify their SHA
@@ -177,7 +179,7 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 		default:
 		}
 
-		log.Debug().Msgf("Checking %q exists and matches SHA", file.Filename)
+		xlog.Debug("Checking file exists and matches SHA", "filename", file.Filename)
 
 		if err := utils.VerifyPath(file.Filename, basePath); err != nil {
 			return nil, err
@@ -189,7 +191,7 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 		if enforceScan {
 			scanResults, err := downloader.HuggingFaceScan(downloader.URI(file.URI))
 			if err != nil && errors.Is(err, downloader.ErrUnsafeFilesFound) {
-				log.Error().Str("model", config.Name).Strs("clamAV", scanResults.ClamAVInfectedFiles).Strs("pickles", scanResults.DangerousPickles).Msg("Contains unsafe file(s)!")
+				xlog.Error("Contains unsafe file(s)!", "model", config.Name, "clamAV", scanResults.ClamAVInfectedFiles, "pickles", scanResults.DangerousPickles)
 				return nil, err
 			}
 		}
@@ -213,12 +215,12 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 			return nil, fmt.Errorf("failed to create parent directory for prompt template %q: %v", template.Name, err)
 		}
 		// Create and write file content
-		err = os.WriteFile(filePath, []byte(template.Content), 0600)
+		err = os.WriteFile(filePath, []byte(template.Content), 0644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to write prompt template %q: %v", template.Name, err)
 		}
 
-		log.Debug().Msgf("Prompt template %q written", template.Name)
+		xlog.Debug("Prompt template written", "template", template.Name)
 	}
 
 	name := config.Name
@@ -237,7 +239,7 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 		configFilePath := filepath.Join(basePath, name+".yaml")
 
 		// Read and update config file as map[string]interface{}
-		configMap := make(map[string]interface{})
+		configMap := make(map[string]any)
 		err = yaml.Unmarshal([]byte(config.ConfigFile), &configMap)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal config YAML: %v", err)
@@ -245,8 +247,10 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 
 		configMap["name"] = name
 
-		if err := mergo.Merge(&configMap, configOverrides, mergo.WithOverride); err != nil {
-			return nil, err
+		if configOverrides != nil {
+			if err := mergo.Merge(&configMap, configOverrides, mergo.WithOverride); err != nil {
+				return nil, err
+			}
 		}
 
 		// Write updated config file
@@ -260,16 +264,59 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 			return nil, fmt.Errorf("failed to unmarshal updated config YAML: %v", err)
 		}
 
+		// Apply model-family-specific inference defaults so they are persisted in the config YAML.
+		// Apply to the typed struct for validation, and merge into configMap for serialization
+		// (configMap preserves unknown fields that ModelConfig would drop).
+		lconfig.ApplyInferenceDefaults(&modelConfig, name, modelConfig.Model)
+
+		// Merge inference defaults into configMap so they are persisted without losing unknown fields.
+		if modelConfig.Temperature != nil {
+			if _, exists := configMap["temperature"]; !exists {
+				configMap["temperature"] = *modelConfig.Temperature
+			}
+		}
+		if modelConfig.TopP != nil {
+			if _, exists := configMap["top_p"]; !exists {
+				configMap["top_p"] = *modelConfig.TopP
+			}
+		}
+		if modelConfig.TopK != nil {
+			if _, exists := configMap["top_k"]; !exists {
+				configMap["top_k"] = *modelConfig.TopK
+			}
+		}
+		if modelConfig.MinP != nil {
+			if _, exists := configMap["min_p"]; !exists {
+				configMap["min_p"] = *modelConfig.MinP
+			}
+		}
+		if modelConfig.RepeatPenalty != 0 {
+			if _, exists := configMap["repeat_penalty"]; !exists {
+				configMap["repeat_penalty"] = modelConfig.RepeatPenalty
+			}
+		}
+		if modelConfig.PresencePenalty != 0 {
+			if _, exists := configMap["presence_penalty"]; !exists {
+				configMap["presence_penalty"] = modelConfig.PresencePenalty
+			}
+		}
+
+		// Re-marshal from configMap to preserve unknown fields
+		updatedConfigYAML, err = yaml.Marshal(configMap)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal config with inference defaults: %v", err)
+		}
+
 		if valid, err := modelConfig.Validate(); !valid {
 			return nil, fmt.Errorf("failed to validate updated config YAML: %v", err)
 		}
 
-		err = os.WriteFile(configFilePath, updatedConfigYAML, 0600)
+		err = os.WriteFile(configFilePath, updatedConfigYAML, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to write updated config file: %v", err)
 		}
 
-		log.Debug().Msgf("Written config file %s", configFilePath)
+		xlog.Debug("Written config file", "file", configFilePath)
 	}
 
 	// Save the model gallery file for further reference
@@ -279,13 +326,19 @@ func InstallModel(ctx context.Context, systemState *system.SystemState, nameOver
 		return nil, err
 	}
 
-	log.Debug().Msgf("Written gallery file %s", modelFile)
+	xlog.Debug("Written gallery file", "file", modelFile)
 
-	return &modelConfig, os.WriteFile(modelFile, data, 0600)
+	return &modelConfig, os.WriteFile(modelFile, data, 0644)
 }
 
 func galleryFileName(name string) string {
 	return "._gallery_" + name + ".yaml"
+}
+
+// GalleryFileName returns the on-disk filename of the gallery metadata file
+// for a given installed model name (e.g. "._gallery_<name>.yaml").
+func GalleryFileName(name string) string {
+	return galleryFileName(name)
 }
 
 func GetLocalModelConfiguration(basePath string, name string) (*ModelConfig, error) {
@@ -341,7 +394,7 @@ func listModelFiles(systemState *system.SystemState, name string) ([]string, err
 			allFiles = append(allFiles, fullPath)
 		}
 	} else {
-		log.Error().Err(err).Msgf("failed to read gallery file %s", configFile)
+		xlog.Error("failed to read gallery file", "error", err, "file", configFile)
 	}
 
 	for _, f := range additionalFiles {
@@ -391,26 +444,26 @@ func DeleteModelFromSystem(systemState *system.SystemState, name string) error {
 		name := strings.TrimSuffix(f.Name(), ".yaml")
 		name = strings.TrimSuffix(name, ".yml")
 
-		log.Debug().Msgf("Checking file %s", f.Name())
+		xlog.Debug("Checking file", "file", f.Name())
 		files, err := listModelFiles(systemState, name)
 		if err != nil {
-			log.Debug().Err(err).Msgf("failed to list files for model %s", f.Name())
+			xlog.Debug("failed to list files for model", "error", err, "model", f.Name())
 			continue
 		}
 		allOtherFiles = append(allOtherFiles, files...)
 	}
 
-	log.Debug().Msgf("Files to remove: %+v", filesToRemove)
-	log.Debug().Msgf("All other files: %+v", allOtherFiles)
+	xlog.Debug("Files to remove", "files", filesToRemove)
+	xlog.Debug("All other files", "files", allOtherFiles)
 
 	// Removing files
 	for _, f := range filesToRemove {
 		if slices.Contains(allOtherFiles, f) {
-			log.Debug().Msgf("Skipping file %s because it is part of another model", f)
+			xlog.Debug("Skipping file because it is part of another model", "file", f)
 			continue
 		}
 		if e := os.Remove(f); e != nil {
-			log.Error().Err(e).Msgf("failed to remove file %s", f)
+			xlog.Error("failed to remove file", "error", e, "file", f)
 		}
 	}
 
@@ -436,7 +489,7 @@ func SafetyScanGalleryModel(galleryModel *GalleryModel) error {
 	for _, file := range galleryModel.AdditionalFiles {
 		scanResults, err := downloader.HuggingFaceScan(downloader.URI(file.URI))
 		if err != nil && errors.Is(err, downloader.ErrUnsafeFilesFound) {
-			log.Error().Str("model", galleryModel.Name).Strs("clamAV", scanResults.ClamAVInfectedFiles).Strs("pickles", scanResults.DangerousPickles).Msg("Contains unsafe file(s)!")
+			xlog.Error("Contains unsafe file(s)!", "model", galleryModel.Name, "clamAV", scanResults.ClamAVInfectedFiles, "pickles", scanResults.DangerousPickles)
 			return err
 		}
 	}

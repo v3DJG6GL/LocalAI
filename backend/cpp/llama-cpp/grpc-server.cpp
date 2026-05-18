@@ -10,6 +10,14 @@
 #include "server-task.cpp"
 #include "server-queue.cpp"
 #include "server-common.cpp"
+// server-chat.cpp exists only in llama.cpp after the upstream refactor that
+// split OAI/Anthropic/Responses/transcription conversion helpers out of
+// server-common.cpp. When present, server-context.cpp and server-task.cpp
+// above call into it, so we must pull its definitions into this TU or the
+// link fails. __has_include keeps the source compatible with older pins.
+#if __has_include("server-chat.cpp")
+#include "server-chat.cpp"
+#endif
 #include "server-context.cpp"
 
 // LocalAI
@@ -17,12 +25,21 @@
 #include "backend.pb.h"
 #include "backend.grpc.pb.h"
 #include "common.h"
+#include "chat-auto-parser.h"
 #include <getopt.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/security/server_credentials.h>
 #include <regex>
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <list>
+#include <map>
+#include <mutex>
 #include <signal.h>
 #include <thread>
 
@@ -35,6 +52,64 @@ using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::Status;
+
+// gRPC bearer token auth for distributed mode.
+// Reads LOCALAI_GRPC_AUTH_TOKEN from the environment. When set, rejects
+// requests without a matching "authorization: Bearer <token>" metadata header.
+
+// Cached auth token — empty means auth is disabled.
+static std::string g_grpc_auth_token;
+
+// Minimal constant-time comparison (avoids OpenSSL dependency)
+static int ct_memcmp(const void* a, const void* b, size_t n) {
+    const unsigned char* pa = static_cast<const unsigned char*>(a);
+    const unsigned char* pb = static_cast<const unsigned char*>(b);
+    unsigned char result = 0;
+    for (size_t i = 0; i < n; i++) {
+        result |= pa[i] ^ pb[i];
+    }
+    return result;
+}
+
+// Returns OK when auth is disabled or the token matches.
+static grpc::Status checkAuth(grpc::ServerContext* context) {
+    if (g_grpc_auth_token.empty()) {
+        return grpc::Status::OK;
+    }
+    auto metadata = context->client_metadata();
+    auto it = metadata.find("authorization");
+    if (it != metadata.end()) {
+        std::string expected = "Bearer " + g_grpc_auth_token;
+        std::string got(it->second.data(), it->second.size());
+        if (expected.size() == got.size() &&
+            ct_memcmp(expected.data(), got.data(), expected.size()) == 0) {
+            return grpc::Status::OK;
+        }
+    }
+    return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "invalid token");
+}
+
+// Minimal base64 encoder. The C++ backend already pulls in base64_decode from
+// llama.cpp's server-common.cpp, but no encoder is exposed — and we need one to
+// hand audio bytes to the existing PredictOptions.audios path (which expects
+// base64-encoded strings, just like images).
+static std::string base64_encode_bytes(const unsigned char* data, size_t len) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t triple = (uint32_t(data[i]) << 16);
+        if (i + 1 < len) triple |= (uint32_t(data[i + 1]) << 8);
+        if (i + 2 < len) triple |= uint32_t(data[i + 2]);
+        out.push_back(tbl[(triple >> 18) & 0x3F]);
+        out.push_back(tbl[(triple >> 12) & 0x3F]);
+        out.push_back(i + 1 < len ? tbl[(triple >> 6) & 0x3F] : '=');
+        out.push_back(i + 2 < len ? tbl[triple & 0x3F]        : '=');
+    }
+    return out;
+}
+
 // END LocalAI
 
 
@@ -78,15 +153,12 @@ static void start_llama_server(server_context& ctx_server) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    ctx_server.init();
-    //state.store(SERVER_STATE_READY);
-
     LOG_INF("%s: model loaded\n", __func__);
 
     // print sample chat example to make it clear which template is used
     // LOG_INF("%s: chat template, chat_template: %s, example_format: '%s'\n", __func__,
-    //     common_chat_templates_source(ctx_server.impl->chat_templates.get()),
-    //     common_chat_format_example(ctx_server.impl->chat_templates.get(), ctx_server.impl->params_base.use_jinja).c_str(), ctx_server.impl->params_base.default_template_kwargs);
+    //     common_chat_templates_source(ctx_server.impl->chat_params.tmpls.get()),
+    //     common_chat_format_example(ctx_server.impl->chat_params.tmpls.get(), ctx_server.impl->params_base.use_jinja).c_str(), ctx_server.impl->params_base.default_template_kwargs);
 
     // Keep the chat templates initialized in load_model() so they can be used when UseTokenizerTemplate is enabled
     // Templates will only be used conditionally in Predict/PredictStream when UseTokenizerTemplate is true and Messages are provided
@@ -137,6 +209,7 @@ json parse_options(bool streaming, const backend::PredictOptions* predict, const
     data["mirostat_eta"] = predict->mirostateta();
     data["n_keep"] = predict->nkeep();
     data["seed"] = predict->seed();
+    data["min_p"] = predict->minp();
 
 
     std::string grammar_str = predict->grammar();
@@ -244,6 +317,12 @@ json parse_options(bool streaming, const backend::PredictOptions* predict, const
 
     data["ignore_eos"] = predict->ignoreeos();
     data["embeddings"] = predict->embeddings();
+
+    // Speculative decoding per-request overrides
+    // NDraft maps to speculative.n_max (maximum draft tokens per speculation step)
+    if (predict->ndraft() > 0) {
+        data["speculative.n_max"] = predict->ndraft();
+    }
 
     // Add the correlationid to json data
     data["correlation_id"] = predict->correlationid();
@@ -354,19 +433,41 @@ static void add_rpc_devices(std::string servers) {
     }
 }
 
-static void params_parse(server_context& ctx_server, const backend::ModelOptions* request,
+static void params_parse(server_context& /*ctx_server*/, const backend::ModelOptions* request,
                                 common_params & params) {
 
     // this is comparable to: https://github.com/ggerganov/llama.cpp/blob/d9b33fe95bd257b36c84ee5769cc048230067d6f/examples/server/server.cpp#L1809
 
     params.model.path = request->modelfile();
     if (!request->mmproj().empty()) {
-    // get the directory of modelfile
-      std::string model_dir = params.model.path.substr(0, params.model.path.find_last_of("/\\"));
-      params.mmproj.path = model_dir + "/"+ request->mmproj();
+      params.mmproj.path = request->mmproj();
     }
+
+    // Draft model for speculative decoding
+    if (!request->draftmodel().empty()) {
+        params.speculative.draft.mparams.path = request->draftmodel();
+        // Default to draft type if a draft model is set but no explicit type.
+        // Upstream (post ggml-org/llama.cpp#22838) made the speculative type a
+        // vector; the turboquant fork still uses the legacy scalar. The
+        // LOCALAI_LEGACY_LLAMA_CPP_SPEC macro is injected by
+        // backend/cpp/turboquant/patch-grpc-server.sh for fork builds only.
+        // Upstream renamed COMMON_SPECULATIVE_TYPE_DRAFT -> ..._DRAFT_SIMPLE
+        // in ggml-org/llama.cpp#22964; the fork still uses the old name.
+#ifdef LOCALAI_LEGACY_LLAMA_CPP_SPEC
+        if (params.speculative.type == COMMON_SPECULATIVE_TYPE_NONE) {
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT;
+        }
+#else
+        const bool no_spec_type = params.speculative.types.empty() ||
+            (params.speculative.types.size() == 1 && params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE);
+        if (no_spec_type) {
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
+        }
+#endif
+    }
+
     //  params.model_alias ??
-    params.model_alias =  request->modelfile();
+    params.model_alias.insert(request->modelfile());
     if (!request->cachetypekey().empty()) {
         params.cache_type_k = kv_cache_type_from_str(request->cachetypekey());
     }
@@ -395,8 +496,9 @@ static void params_parse(server_context& ctx_server, const backend::ModelOptions
     // Initialize fit_params options (can be overridden by options)
     // fit_params: whether to auto-adjust params to fit device memory (default: true as in llama.cpp)
     params.fit_params = true;
-    // fit_params_target: target margin per device in bytes (default: 1GB)
-    params.fit_params_target = 1024 * 1024 * 1024;
+    // fit_params_target: target margin per device in bytes (default: 1GB per device)
+    // Initialize as vector with default value for all devices
+    params.fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024 * 1024);
     // fit_params_min_ctx: minimum context size for fit (default: 4096)
     params.fit_params_min_ctx = 4096;
 
@@ -419,6 +521,12 @@ static void params_parse(server_context& ctx_server, const backend::ModelOptions
     params.kv_unified = false;
     // n_ctx_checkpoints: max context checkpoints per slot (default: 8)
     params.n_ctx_checkpoints = 8;
+
+    // llama memory fit fails if we don't provide a buffer for tensor overrides
+    const size_t ntbo = llama_max_tensor_buft_overrides();
+    while (params.tensor_buft_overrides.size() < ntbo) {
+        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
 
      // decode options. Options are in form optname:optvale, or if booleans only optname.
     for (int i = 0; i < request->options_size(); i++) {
@@ -473,10 +581,28 @@ static void params_parse(server_context& ctx_server, const backend::ModelOptions
         } else if (!strcmp(optname, "fit_params_target") || !strcmp(optname, "fit_target")) {
             if (optval != NULL) {
                 try {
-                    // Value is in MiB, convert to bytes
-                    params.fit_params_target = static_cast<size_t>(std::stoi(optval_str)) * 1024 * 1024;
+                    // Value is in MiB, can be comma-separated list for multiple devices
+                    // Single value is broadcast across all devices
+                    std::string arg_next = optval_str;
+                    const std::regex regex{ R"([,/]+)" };
+                    std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+                    std::vector<std::string> split_arg{ it, {} };
+                    if (split_arg.size() >= llama_max_devices()) {
+                        // Too many values provided
+                        continue;
+                    }
+                    if (split_arg.size() == 1) {
+                        // Single value: broadcast to all devices
+                        size_t value_mib = std::stoul(split_arg[0]);
+                        std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), value_mib * 1024 * 1024);
+                    } else {
+                        // Multiple values: set per device
+                        for (size_t i = 0; i < split_arg.size() && i < params.fit_params_target.size(); i++) {
+                            params.fit_params_target[i] = std::stoul(split_arg[i]) * 1024 * 1024;
+                        }
+                    }
                 } catch (const std::exception& e) {
-                    // If conversion fails, keep default value (1GB)
+                    // If conversion fails, keep default value (1GB per device)
                 }
             }
         } else if (!strcmp(optname, "fit_params_min_ctx") || !strcmp(optname, "fit_ctx")) {
@@ -533,6 +659,21 @@ static void params_parse(server_context& ctx_server, const backend::ModelOptions
             } else if (optval_str == "false" || optval_str == "0" || optval_str == "no" || optval_str == "off" || optval_str == "disabled") {
                 params.no_op_offload = false;
             }
+        } else if (!strcmp(optname, "split_mode") || !strcmp(optname, "sm")) {
+            // Accepts: none | layer | row | tensor (the latter requires a llama.cpp build
+            // that includes ggml-org/llama.cpp#19378, FlashAttention enabled, and KV-cache
+            // quantization disabled).
+            if (optval != NULL) {
+                if (optval_str == "none") {
+                    params.split_mode = LLAMA_SPLIT_MODE_NONE;
+                } else if (optval_str == "layer") {
+                    params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+                } else if (optval_str == "row") {
+                    params.split_mode = LLAMA_SPLIT_MODE_ROW;
+                } else if (optval_str == "tensor") {
+                    params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+                }
+            }
         } else if (!strcmp(optname, "kv_unified") || !strcmp(optname, "unified_kv")) {
             if (optval_str == "true" || optval_str == "1" || optval_str == "yes" || optval_str == "on" || optval_str == "enabled") {
                 params.kv_unified = true;
@@ -547,7 +688,360 @@ static void params_parse(server_context& ctx_server, const backend::ModelOptions
                     // If conversion fails, keep default value (8)
                 }
             }
+
+        // --- physical batch size (upstream -ub / --ubatch-size) ---
+        // Note: line ~482 already aliases n_ubatch to n_batch as a default; this
+        // option lets users decouple the two (useful for embeddings/rerank).
+        } else if (!strcmp(optname, "n_ubatch") || !strcmp(optname, "ubatch")) {
+            if (optval != NULL) {
+                try { params.n_ubatch = std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- main-model batch threads (upstream -tb / --threads-batch) ---
+        } else if (!strcmp(optname, "threads_batch") || !strcmp(optname, "n_threads_batch")) {
+            if (optval != NULL) {
+                try {
+                    int n = std::stoi(optval_str);
+                    if (n <= 0) n = (int)std::thread::hardware_concurrency();
+                    params.cpuparams_batch.n_threads = n;
+                } catch (...) {}
+            }
+
+        // --- pooling type for embeddings (upstream --pooling) ---
+        } else if (!strcmp(optname, "pooling_type") || !strcmp(optname, "pooling")) {
+            if (optval != NULL) {
+                if      (optval_str == "none") params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+                else if (optval_str == "mean") params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+                else if (optval_str == "cls")  params.pooling_type = LLAMA_POOLING_TYPE_CLS;
+                else if (optval_str == "last") params.pooling_type = LLAMA_POOLING_TYPE_LAST;
+                else if (optval_str == "rank") params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+                // unknown values silently leave UNSPECIFIED (auto-detect)
+            }
+
+        // --- llama log verbosity threshold (upstream -lv / --verbosity) ---
+        } else if (!strcmp(optname, "verbosity")) {
+            if (optval != NULL) {
+                try { params.verbosity = std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- O_DIRECT model loading (upstream --direct-io) ---
+        } else if (!strcmp(optname, "direct_io") || !strcmp(optname, "use_direct_io")) {
+            if (optval_str == "true" || optval_str == "1" || optval_str == "yes" || optval_str == "on" || optval_str == "enabled") {
+                params.use_direct_io = true;
+            } else if (optval_str == "false" || optval_str == "0" || optval_str == "no" || optval_str == "off" || optval_str == "disabled") {
+                params.use_direct_io = false;
+            }
+
+        // --- embedding normalization (upstream --embd-normalize) ---
+        // -1 none, 0 max-abs, 1 taxicab, 2 L2 (default), >2 p-norm
+        } else if (!strcmp(optname, "embd_normalize") || !strcmp(optname, "embedding_normalize")) {
+            if (optval != NULL) {
+                try { params.embd_normalize = std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- reasoning parser (upstream --reasoning-format) ---
+        // Picks the parser for <think> blocks emitted by reasoning models.
+        // none / auto / deepseek / deepseek-legacy
+        } else if (!strcmp(optname, "reasoning_format")) {
+            if (optval != NULL) {
+                if      (optval_str == "none")             params.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+                else if (optval_str == "auto")             params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+                else if (optval_str == "deepseek")         params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+                else if (optval_str == "deepseek-legacy" || optval_str == "deepseek_legacy")
+                                                            params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
+                // unknown values silently keep the upstream default (DEEPSEEK)
+            }
+
+        // --- reasoning budget (upstream --reasoning-budget) ---
+        // -1 unlimited, 0 disabled, >0 token budget for thinking blocks.
+        // Distinct from per-request `enable_thinking` (chat_template_kwargs).
+        } else if (!strcmp(optname, "enable_reasoning") || !strcmp(optname, "reasoning_budget")) {
+            if (optval != NULL) {
+                try { params.enable_reasoning = std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- prefill assistant turn (upstream --no-prefill-assistant) ---
+        } else if (!strcmp(optname, "prefill_assistant")) {
+            if (optval_str == "true" || optval_str == "1" || optval_str == "yes" || optval_str == "on" || optval_str == "enabled") {
+                params.prefill_assistant = true;
+            } else if (optval_str == "false" || optval_str == "0" || optval_str == "no" || optval_str == "off" || optval_str == "disabled") {
+                params.prefill_assistant = false;
+            }
+
+        // --- mmproj GPU offload (upstream --no-mmproj-offload, inverted) ---
+        } else if (!strcmp(optname, "mmproj_use_gpu") || !strcmp(optname, "mmproj_offload")) {
+            if (optval_str == "true" || optval_str == "1" || optval_str == "yes" || optval_str == "on" || optval_str == "enabled") {
+                params.mmproj_use_gpu = true;
+            } else if (optval_str == "false" || optval_str == "0" || optval_str == "no" || optval_str == "off" || optval_str == "disabled") {
+                params.mmproj_use_gpu = false;
+            }
+
+        // --- per-image vision token budget (upstream --image-min/max-tokens) ---
+        } else if (!strcmp(optname, "image_min_tokens")) {
+            if (optval != NULL) {
+                try { params.image_min_tokens = std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "image_max_tokens")) {
+            if (optval != NULL) {
+                try { params.image_max_tokens = std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- main-model tensor buffer overrides (upstream --override-tensor) ---
+        // Format: <tensor regex>=<buffer type>,<tensor regex>=<buffer type>,...
+        // Mirrors the existing `draft_override_tensor` parser below.
+        } else if (!strcmp(optname, "override_tensor") || !strcmp(optname, "tensor_buft_overrides")) {
+            ggml_backend_load_all();
+            std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                auto * buft = ggml_backend_dev_buffer_type(dev);
+                if (buft) {
+                    buft_list[ggml_backend_buft_name(buft)] = buft;
+                }
+            }
+            static std::list<std::string> override_names;
+            std::string cur;
+            auto flush = [&](const std::string & spec) {
+                auto pos = spec.find('=');
+                if (pos == std::string::npos) return;
+                const std::string name = spec.substr(0, pos);
+                const std::string type = spec.substr(pos + 1);
+                auto it = buft_list.find(type);
+                if (it == buft_list.end()) return; // unknown buffer type: ignore
+                override_names.push_back(name);
+                params.tensor_buft_overrides.push_back(
+                    {override_names.back().c_str(), it->second});
+            };
+            for (char c : optval_str) {
+                if (c == ',') { if (!cur.empty()) { flush(cur); cur.clear(); } }
+                else { cur.push_back(c); }
+            }
+            if (!cur.empty()) flush(cur);
+
+        // Speculative decoding options
+        } else if (!strcmp(optname, "spec_type") || !strcmp(optname, "speculative_type")) {
+#ifdef LOCALAI_LEGACY_LLAMA_CPP_SPEC
+            // Fork only knows a single scalar `type`. Take the first comma-
+            // separated value and assign it via the singular helper.
+            std::string first = optval_str;
+            const auto comma = first.find(',');
+            if (comma != std::string::npos) first = first.substr(0, comma);
+            auto type = common_speculative_type_from_name(first);
+            if (type != COMMON_SPECULATIVE_TYPE_COUNT) {
+                params.speculative.type = type;
+            }
+#else
+            // Upstream switched to a vector of types (comma-separated for multi-type
+            // chaining via common_speculative_types_from_names). We keep accepting a
+            // single value here, but also tolerate comma-separated lists.
+            //
+            // ggml-org/llama.cpp#22964 also renamed the registered names from
+            // underscore- to dash-separated form, and replaced the bare
+            // `draft`/`eagle3` aliases with `draft-simple`/`draft-eagle3`. We
+            // normalize each token here so existing model configs keep working.
+            auto normalize_spec_name = [](std::string s) -> std::string {
+                std::replace(s.begin(), s.end(), '_', '-');
+                if (s == "draft")  return "draft-simple";
+                if (s == "eagle3") return "draft-eagle3";
+                return s;
+            };
+            std::vector<std::string> names;
+            std::string item;
+            for (char c : optval_str) {
+                if (c == ',') {
+                    if (!item.empty()) { names.push_back(normalize_spec_name(item)); item.clear(); }
+                } else {
+                    item.push_back(c);
+                }
+            }
+            if (!item.empty()) names.push_back(normalize_spec_name(item));
+            auto parsed = common_speculative_types_from_names(names);
+            if (!parsed.empty()) {
+                params.speculative.types = parsed;
+            }
+#endif
+        } else if (!strcmp(optname, "spec_n_max") || !strcmp(optname, "draft_max")) {
+            if (optval != NULL) {
+                try { params.speculative.draft.n_max = std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_n_min") || !strcmp(optname, "draft_min")) {
+            if (optval != NULL) {
+                try { params.speculative.draft.n_min = std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_p_min") || !strcmp(optname, "draft_p_min")) {
+            if (optval != NULL) {
+                try { params.speculative.draft.p_min = std::stof(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_p_split")) {
+            if (optval != NULL) {
+                try { params.speculative.draft.p_split = std::stof(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_size_n") || !strcmp(optname, "ngram_size_n")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_simple.size_n = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_size_m") || !strcmp(optname, "ngram_size_m")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_simple.size_m = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_min_hits") || !strcmp(optname, "ngram_min_hits")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_simple.min_hits = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "draft_gpu_layers")) {
+            if (optval != NULL) {
+                try { params.speculative.draft.n_gpu_layers = std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "draft_ctx_size")) {
+            // The draft context size is no longer a separate field upstream: the draft
+            // shares the target context size. Accept the option for backward
+            // compatibility but silently ignore it.
+
+// Everything below relies on struct shape introduced in ggml-org/llama.cpp#22838
+// (parallel drafting): `ngram_mod`, `ngram_map_k`, `ngram_map_k4v`,
+// `ngram_cache`, and the `draft.{cache_type_*, cpuparams*, tensor_buft_overrides}`
+// fields. The turboquant fork branched before that, so its build defines
+// LOCALAI_LEGACY_LLAMA_CPP_SPEC via patch-grpc-server.sh and these option
+// keys become unrecognized (silently dropped, like any unknown opt) for it.
+//
+// The `#ifdef LOCALAI_LEGACY_LLAMA_CPP_SPEC` / `#else` split below sits at the
+// closing-brace position of the `draft_ctx_size` branch on purpose: in the
+// legacy build the chain ends here (the brace closes draft_ctx_size), and in
+// the modern build the chain continues with `} else if (...)` instead, so the
+// brace count stays balanced under both branches of the preprocessor.
+#ifdef LOCALAI_LEGACY_LLAMA_CPP_SPEC
         }
+#else
+        // --- ngram_mod family (upstream --spec-ngram-mod-*) ---
+        } else if (!strcmp(optname, "spec_ngram_mod_n_min")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_mod.n_min = std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_mod_n_max")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_mod.n_max = std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_mod_n_match")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_mod.n_match = std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- ngram_map_k family (upstream --spec-ngram-map-k-*) ---
+        } else if (!strcmp(optname, "spec_ngram_map_k_size_n")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_map_k.size_n = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_map_k_size_m")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_map_k.size_m = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_map_k_min_hits")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_map_k.min_hits = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- ngram_map_k4v family (upstream --spec-ngram-map-k4v-*) ---
+        } else if (!strcmp(optname, "spec_ngram_map_k4v_size_n")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_map_k4v.size_n = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_map_k4v_size_m")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_map_k4v.size_m = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+        } else if (!strcmp(optname, "spec_ngram_map_k4v_min_hits")) {
+            if (optval != NULL) {
+                try { params.speculative.ngram_map_k4v.min_hits = (uint16_t)std::stoi(optval_str); } catch (...) {}
+            }
+
+        // --- ngram lookup caches (upstream --lookup-cache-static / -dynamic) ---
+        } else if (!strcmp(optname, "spec_lookup_cache_static") || !strcmp(optname, "lookup_cache_static")) {
+            params.speculative.ngram_cache.lookup_cache_static = optval_str;
+        } else if (!strcmp(optname, "spec_lookup_cache_dynamic") || !strcmp(optname, "lookup_cache_dynamic")) {
+            params.speculative.ngram_cache.lookup_cache_dynamic = optval_str;
+
+        // --- draft model KV cache types (upstream --spec-draft-type-k / -v) ---
+        } else if (!strcmp(optname, "draft_cache_type_k") || !strcmp(optname, "spec_draft_cache_type_k")) {
+            params.speculative.draft.cache_type_k = kv_cache_type_from_str(optval_str);
+        } else if (!strcmp(optname, "draft_cache_type_v") || !strcmp(optname, "spec_draft_cache_type_v")) {
+            params.speculative.draft.cache_type_v = kv_cache_type_from_str(optval_str);
+
+        // --- draft model thread counts (upstream --spec-draft-threads / -batch) ---
+        } else if (!strcmp(optname, "draft_threads") || !strcmp(optname, "spec_draft_threads")) {
+            if (optval != NULL) {
+                try {
+                    int n = std::stoi(optval_str);
+                    if (n <= 0) n = (int)std::thread::hardware_concurrency();
+                    params.speculative.draft.cpuparams.n_threads = n;
+                } catch (...) {}
+            }
+        } else if (!strcmp(optname, "draft_threads_batch") || !strcmp(optname, "spec_draft_threads_batch")) {
+            if (optval != NULL) {
+                try {
+                    int n = std::stoi(optval_str);
+                    if (n <= 0) n = (int)std::thread::hardware_concurrency();
+                    params.speculative.draft.cpuparams_batch.n_threads = n;
+                } catch (...) {}
+            }
+
+        // --- draft model MoE on CPU (upstream --spec-draft-cpu-moe / --spec-draft-n-cpu-moe) ---
+        } else if (!strcmp(optname, "draft_cpu_moe") || !strcmp(optname, "spec_draft_cpu_moe")) {
+            // Bool-style flag: optval may be missing, "true"/"1"/"yes" enables.
+            const bool enable = (optval == NULL) ||
+                optval_str == "true" || optval_str == "1" || optval_str == "yes" ||
+                optval_str == "on" || optval_str == "enabled";
+            if (enable) {
+                params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            }
+        } else if (!strcmp(optname, "draft_n_cpu_moe") || !strcmp(optname, "spec_draft_n_cpu_moe")) {
+            if (optval != NULL) {
+                try {
+                    int n = std::stoi(optval_str);
+                    if (n < 0) n = 0;
+                    // Keep override-name storage alive for the lifetime of the params struct
+                    // (mirrors upstream arg.cpp behavior with a function-local static).
+                    static std::list<std::string> buft_overrides_draft;
+                    for (int i = 0; i < n; ++i) {
+                        buft_overrides_draft.push_back(llm_ffn_exps_block_regex(i));
+                        params.speculative.draft.tensor_buft_overrides.push_back(
+                            {buft_overrides_draft.back().c_str(), ggml_backend_cpu_buffer_type()});
+                    }
+                } catch (...) {}
+            }
+
+        // --- draft model tensor buffer overrides (upstream --spec-draft-override-tensor) ---
+        } else if (!strcmp(optname, "draft_override_tensor") || !strcmp(optname, "spec_draft_override_tensor")) {
+            // Format: <tensor regex>=<buffer type>,<tensor regex>=<buffer type>,...
+            // We replicate upstream's parse_tensor_buffer_overrides (static in arg.cpp).
+            ggml_backend_load_all();
+            std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                auto * buft = ggml_backend_dev_buffer_type(dev);
+                if (buft) {
+                    buft_list[ggml_backend_buft_name(buft)] = buft;
+                }
+            }
+            static std::list<std::string> draft_override_names;
+            std::string cur;
+            auto flush = [&](const std::string & spec) {
+                auto pos = spec.find('=');
+                if (pos == std::string::npos) return;
+                const std::string name = spec.substr(0, pos);
+                const std::string type = spec.substr(pos + 1);
+                auto it = buft_list.find(type);
+                if (it == buft_list.end()) return; // unknown buffer type: ignore
+                draft_override_names.push_back(name);
+                params.speculative.draft.tensor_buft_overrides.push_back(
+                    {draft_override_names.back().c_str(), it->second});
+            };
+            for (char c : optval_str) {
+                if (c == ',') { if (!cur.empty()) { flush(cur); cur.clear(); } }
+                else { cur.push_back(c); }
+            }
+            if (!cur.empty()) flush(cur);
+        }
+#endif // LOCALAI_LEGACY_LLAMA_CPP_SPEC — closes the `else`/`#ifdef` opened at draft_ctx_size
     }
 
     // Set params.n_parallel from environment variable if not set via options (fallback)
@@ -686,18 +1180,22 @@ static void params_parse(server_context& ctx_server, const backend::ModelOptions
 class BackendServiceImpl final : public backend::Backend::Service {
 private:
     server_context& ctx_server;
-    const common_params* params_base_ptr; // Store pointer to params_base, set after model load
+    common_params params_base; // Store copy of params_base, set after model load
 
 public:
-    BackendServiceImpl(server_context& ctx) : ctx_server(ctx), params_base_ptr(nullptr) {}
+    BackendServiceImpl(server_context& ctx) : ctx_server(ctx) {}
 
-    grpc::Status Health(ServerContext* context, const backend::HealthMessage* request, backend::Reply* reply) {
+    grpc::Status Health(ServerContext* context, const backend::HealthMessage* /*request*/, backend::Reply* reply) override {
+        auto auth = checkAuth(context);
+        if (!auth.ok()) return auth;
         // Implement Health RPC
         reply->set_message("OK");
         return Status::OK;
     }
 
-    grpc::Status LoadModel(ServerContext* context, const backend::ModelOptions* request, backend::Result* result) {
+    grpc::Status LoadModel(ServerContext* context, const backend::ModelOptions* request, backend::Result* result) override {
+        auto auth = checkAuth(context);
+        if (!auth.ok()) return auth;
         // Implement LoadModel RPC
         common_params params;
         params_parse(ctx_server, request, params);
@@ -714,11 +1212,72 @@ public:
         LOG_INF("\n");
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
         LOG_INF("\n");
+        
+        // Capture error messages during model loading
+        struct error_capture {
+            std::string captured_error;
+            std::mutex error_mutex;
+            ggml_log_callback original_callback;
+            void* original_user_data;
+        } error_capture_data;
+        
+        // Get original log callback
+        llama_log_get(&error_capture_data.original_callback, &error_capture_data.original_user_data);
+        
+        // Set custom callback to capture errors
+        llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+            auto* capture = static_cast<error_capture*>(user_data);
+            
+            // Capture error messages
+            if (level == GGML_LOG_LEVEL_ERROR) {
+                std::lock_guard<std::mutex> lock(capture->error_mutex);
+                // Append error message, removing trailing newlines
+                std::string msg(text);
+                while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
+                    msg.pop_back();
+                }
+                if (!msg.empty()) {
+                    if (!capture->captured_error.empty()) {
+                        capture->captured_error.append("; ");
+                    }
+                    capture->captured_error.append(msg);
+                }
+            }
+            
+            // Also call original callback to preserve logging
+            if (capture->original_callback) {
+                capture->original_callback(level, text, capture->original_user_data);
+            }
+        }, &error_capture_data);
+        
         // load the model
-        if (!ctx_server.load_model(params)) {
-            result->set_message("Failed loading model");
+        bool load_success = ctx_server.load_model(params);
+        
+        // Restore original log callback
+        llama_log_set(error_capture_data.original_callback, error_capture_data.original_user_data);
+        
+        if (!load_success) {
+            std::string error_msg = "Failed to load model: " + params.model.path;
+            if (!params.mmproj.path.empty()) {
+                error_msg += " (with mmproj: " + params.mmproj.path + ")";
+            }
+            if (params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty()) {
+                error_msg += " (with draft model: " + params.speculative.draft.mparams.path + ")";
+            }
+            
+            // Add captured error details if available
+            {
+                std::lock_guard<std::mutex> lock(error_capture_data.error_mutex);
+                if (!error_capture_data.captured_error.empty()) {
+                    error_msg += ". Error: " + error_capture_data.captured_error;
+                } else {
+                    error_msg += ". Model file may not exist or be invalid.";
+                }
+            }
+            
+            result->set_message(error_msg);
             result->set_success(false);
-            return Status::CANCELLED;
+            return grpc::Status(grpc::StatusCode::INTERNAL, error_msg);
         }
 
         // Process grammar triggers now that vocab is available
@@ -748,19 +1307,16 @@ public:
                     processed_triggers.push_back(trigger);
                 }
             }
-            // Update the grammar triggers in params_base
-            ctx_server.impl->params_base.sampling.grammar_triggers = std::move(processed_triggers);
-            // Also update preserved_tokens in params_base
-            ctx_server.impl->params_base.sampling.preserved_tokens = params.sampling.preserved_tokens;
+            // Update the grammar triggers in params
+            params.sampling.grammar_triggers = std::move(processed_triggers);
         }
 
         //ctx_server.init();
         result->set_message("Loading succeeded");
         result->set_success(true);
         loaded_model = true;
-        ctx_server.impl->slot_prompt_similarity = params.slot_prompt_similarity;
-        // Store pointer to params_base for use in parse_options
-        params_base_ptr = &ctx_server.impl->params_base;
+        // Store copy of params_base for use in parse_options and other methods
+        params_base = params;
 
         return Status::OK;
     }
@@ -787,15 +1343,67 @@ public:
         return logprobs_json;
     }
 
+    // Helper: populate chat_deltas on a Reply from oaicompat_msg_diffs (streaming chunks)
+    static void populate_chat_deltas_from_diffs(backend::Reply & reply,
+                                                const std::vector<common_chat_msg_diff> & diffs) {
+        for (const auto & diff : diffs) {
+            auto* delta = reply.add_chat_deltas();
+            if (!diff.content_delta.empty()) {
+                delta->set_content(diff.content_delta);
+            }
+            if (!diff.reasoning_content_delta.empty()) {
+                delta->set_reasoning_content(diff.reasoning_content_delta);
+            }
+            if (diff.tool_call_index != std::string::npos) {
+                auto* tc = delta->add_tool_calls();
+                tc->set_index(static_cast<int32_t>(diff.tool_call_index));
+                if (!diff.tool_call_delta.id.empty()) {
+                    tc->set_id(diff.tool_call_delta.id);
+                }
+                if (!diff.tool_call_delta.name.empty()) {
+                    tc->set_name(diff.tool_call_delta.name);
+                }
+                if (!diff.tool_call_delta.arguments.empty()) {
+                    tc->set_arguments(diff.tool_call_delta.arguments);
+                }
+            }
+        }
+    }
+
+    // Helper: populate chat_deltas on a Reply from final oaicompat_msg (non-streaming)
+    static void populate_chat_deltas_from_final(backend::Reply & reply,
+                                                const common_chat_msg & msg) {
+        // Content delta
+        if (!msg.content.empty() || !msg.reasoning_content.empty() || !msg.tool_calls.empty()) {
+            auto* delta = reply.add_chat_deltas();
+            if (!msg.content.empty()) {
+                delta->set_content(msg.content);
+            }
+            if (!msg.reasoning_content.empty()) {
+                delta->set_reasoning_content(msg.reasoning_content);
+            }
+            // Tool calls as individual deltas within the same ChatDelta
+            for (size_t i = 0; i < msg.tool_calls.size(); i++) {
+                auto* tc = delta->add_tool_calls();
+                tc->set_index(static_cast<int32_t>(i));
+                tc->set_id(msg.tool_calls[i].id);
+                tc->set_name(msg.tool_calls[i].name);
+                tc->set_arguments(msg.tool_calls[i].arguments);
+            }
+        }
+    }
+
     grpc::Status PredictStream(grpc::ServerContext* context, const backend::PredictOptions* request, grpc::ServerWriter<backend::Reply>* writer) override {
-        if (!params_base_ptr) {
+        auto auth = checkAuth(context);
+        if (!auth.ok()) return auth;
+        if (params_base.model.path.empty()) {
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "Model not loaded");
         }
-        json data = parse_options(true, request, *params_base_ptr, ctx_server.get_llama_context());
+        json data = parse_options(true, request, params_base, ctx_server.get_llama_context());
 
 
         //Raise error if embeddings is set to true
-        if (ctx_server.impl->params_base.embedding) {
+        if (params_base.embedding) {
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Embedding is not supported in streaming mode");
         }
 
@@ -809,7 +1417,7 @@ public:
             std::string prompt_str;
             std::vector<raw_buffer> files; // Declare files early so it's accessible in both branches
             // Handle chat templates when UseTokenizerTemplate is enabled and Messages are provided
-            if (request->usetokenizertemplate() && request->messages_size() > 0 && ctx_server.impl->chat_templates != nullptr) {
+            if (request->usetokenizertemplate() && request->messages_size() > 0 && ctx_server.impl->chat_params.tmpls != nullptr) {
                 // Convert proto Messages to JSON format compatible with oaicompat_chat_params_parse
                 json body_json;
                 json messages_json = json::array();
@@ -1075,6 +1683,7 @@ public:
 
                 body_json["messages"] = messages_json;
                 body_json["stream"] = true; // PredictStream is always streaming
+                body_json["stream_options"] = {{"include_usage", true}}; // Ensure token counts in final chunk
 
                 // Check if grammar is provided from Go layer (NoGrammar=false)
                 // If grammar is provided, we must use it and NOT let template generate grammar from tools
@@ -1182,18 +1791,59 @@ public:
                     body_json["add_generation_prompt"] = data["add_generation_prompt"];
                 }
 
+                // Pass sampling parameters to body_json so oaicompat_chat_params_parse respects them
+                // and doesn't overwrite them with defaults in the returned parsed_data
+                if (data.contains("n_predict")) {
+                    body_json["max_tokens"] = data["n_predict"];
+                }
+                if (data.contains("ignore_eos")) {
+                    body_json["ignore_eos"] = data["ignore_eos"];
+                }
+                if (data.contains("stop")) {
+                    body_json["stop"] = data["stop"];
+                }
+                if (data.contains("temperature")) {
+                    body_json["temperature"] = data["temperature"];
+                }
+                if (data.contains("top_p")) {
+                    body_json["top_p"] = data["top_p"];
+                }
+                if (data.contains("frequency_penalty")) {
+                    body_json["frequency_penalty"] = data["frequency_penalty"];
+                }
+                if (data.contains("presence_penalty")) {
+                    body_json["presence_penalty"] = data["presence_penalty"];
+                }
+                if (data.contains("seed")) {
+                    body_json["seed"] = data["seed"];
+                }
+                if (data.contains("logit_bias")) {
+                    body_json["logit_bias"] = data["logit_bias"];
+                }
+                if (data.contains("top_k")) {
+                    body_json["top_k"] = data["top_k"];
+                }
+                if (data.contains("min_p")) {
+                    body_json["min_p"] = data["min_p"];
+                }
+
+                // Pass enable_thinking via chat_template_kwargs (where oaicompat_chat_params_parse reads it)
+                const auto& metadata = request->metadata();
+                auto et_it = metadata.find("enable_thinking");
+                if (et_it != metadata.end()) {
+                    if (!body_json.contains("chat_template_kwargs")) {
+                        body_json["chat_template_kwargs"] = json::object();
+                    }
+                    body_json["chat_template_kwargs"]["enable_thinking"] = (et_it->second == "true");
+                }
+
                 // Debug: Print full body_json before template processing (includes messages, tools, tool_choice, etc.)
                 SRV_DBG("[CONVERSATION DEBUG] PredictStream: Full body_json before oaicompat_chat_params_parse:\n%s\n", body_json.dump(2).c_str());
 
                 // Use the same approach as server.cpp: call oaicompat_chat_params_parse
                 // This handles all template application, grammar merging, etc. automatically
                 // Files extracted from multimodal content in messages will be added to the files vector
-                // Create parser options with current chat_templates to ensure tmpls is not null
-                oaicompat_parser_options parser_opt = ctx_server.impl->oai_parser_opt;
-                parser_opt.tmpls = ctx_server.impl->chat_templates.get(); // Ensure tmpls is set to current chat_templates
-                // Update allow_image and allow_audio based on current mctx state
-                parser_opt.allow_image = ctx_server.impl->mctx ? mtmd_support_vision(ctx_server.impl->mctx) : false;
-                parser_opt.allow_audio = ctx_server.impl->mctx ? mtmd_support_audio(ctx_server.impl->mctx) : false;
+                // chat_params already contains tmpls, allow_image, and allow_audio set during model loading
 
                 // Debug: Log tools before template processing
                 if (body_json.contains("tools")) {
@@ -1239,7 +1889,7 @@ public:
                     }
                 }
 
-                json parsed_data = oaicompat_chat_params_parse(body_json, parser_opt, files);
+                json parsed_data = oaicompat_chat_params_parse(body_json, ctx_server.impl->chat_params, files);
 
                 // Debug: Log tools after template processing
                 if (parsed_data.contains("tools")) {
@@ -1292,7 +1942,7 @@ public:
 
             // If not using chat templates, extract files from image_data/audio_data fields
             // (If using chat templates, files were already extracted by oaicompat_chat_params_parse)
-            if (!request->usetokenizertemplate() || request->messages_size() == 0 || ctx_server.impl->chat_templates == nullptr) {
+            if (!request->usetokenizertemplate() || request->messages_size() == 0 || ctx_server.impl->chat_params.tmpls == nullptr) {
                 const auto &images_data = data.find("image_data");
                 if (images_data != data.end() && images_data->is_array())
                 {
@@ -1335,13 +1985,18 @@ public:
 
                 task.tokens    = std::move(inputs[i]);
                 task.params           = server_task::params_from_json_cmpl(
-                        ctx_server.get_llama_context(),
-                        ctx_server.impl->params_base,
+                        ctx_server.impl->vocab,
+                        params_base,
+                        ctx_server.get_meta().slot_n_ctx,
+                        ctx_server.get_meta().logit_bias_eog,
                         data);
                 task.id_slot = json_value(data, "id_slot", -1);
 
-                // OAI-compat
-                task.params.res_type                 = TASK_RESPONSE_TYPE_NONE;
+                // OAI-compat: enable autoparser (PEG-based chat parsing) so that
+                // reasoning, tool calls, and content are classified into ChatDeltas.
+                // Without this, the PEG parser never produces diffs and the Go side
+                // cannot detect tool calls or separate reasoning from content.
+                task.params.res_type                 = TASK_RESPONSE_TYPE_OAI_CHAT;
                 task.params.oaicompat_cmpl_id         = completion_id;
                 // oaicompat_model is already populated by params_from_json_cmpl
 
@@ -1366,127 +2021,125 @@ public:
             return grpc::Status(grpc::StatusCode::INTERNAL, error_json.value("message", "Error occurred"));
         }
 
-        // Process first result
+        // Lambda to build a Reply from JSON + attach chat deltas from a result.
+        // Handles both native format ({"content": "..."}) and OAI chat format
+        // ({"choices": [{"delta": {"content": "...", "reasoning": "..."}}]}).
+        auto build_reply_from_json = [](const json & res_json, server_task_result * raw_result) -> backend::Reply {
+            backend::Reply reply;
+            std::string completion_text;
+
+            if (res_json.contains("choices")) {
+                // OAI chat format — extract content from choices[0].delta
+                const auto & choices = res_json.at("choices");
+                if (!choices.empty()) {
+                    const auto & delta = choices[0].value("delta", json::object());
+                    if (delta.contains("content") && !delta.at("content").is_null()) {
+                        completion_text = delta.at("content").get<std::string>();
+                    }
+                }
+            } else {
+                // Native llama.cpp format
+                completion_text = res_json.value("content", "");
+            }
+
+            reply.set_message(completion_text);
+
+            // Token counts: native format has top-level fields,
+            // OAI format has them in "usage" (final chunk only)
+            if (res_json.contains("usage")) {
+                const auto & usage = res_json.at("usage");
+                reply.set_tokens(usage.value("completion_tokens", 0));
+                reply.set_prompt_tokens(usage.value("prompt_tokens", 0));
+            } else {
+                reply.set_tokens(res_json.value("tokens_predicted", 0));
+                reply.set_prompt_tokens(res_json.value("tokens_evaluated", 0));
+            }
+
+            // Timings: present as top-level "timings" in both formats
+            if (res_json.contains("timings")) {
+                reply.set_timing_prompt_processing(res_json.at("timings").value("prompt_ms", 0.0));
+                reply.set_timing_token_generation(res_json.at("timings").value("predicted_ms", 0.0));
+            }
+
+            // Logprobs: extract_logprobs_from_json handles both formats
+            json logprobs_json = extract_logprobs_from_json(res_json);
+            if (!logprobs_json.empty() && !logprobs_json.is_null()) {
+                reply.set_logprobs(logprobs_json.dump());
+            }
+
+            return reply;
+        };
+
+        // Attach chat deltas from the autoparser to a Reply.
+        // When diffs are available, populate ChatDeltas on the reply.
+        // The raw message is always preserved so the Go side can use it
+        // for reasoning extraction and tool call parsing as a fallback
+        // (important in distributed mode where ChatDeltas may not be
+        // the primary parsing path).
+        auto attach_chat_deltas = [](backend::Reply & reply, server_task_result * raw_result) {
+            // Try streaming partial result first
+            auto* partial = dynamic_cast<server_task_result_cmpl_partial*>(raw_result);
+            if (partial && !partial->oaicompat_msg_diffs.empty()) {
+                populate_chat_deltas_from_diffs(reply, partial->oaicompat_msg_diffs);
+                return;
+            }
+            // Try final result
+            auto* final_res = dynamic_cast<server_task_result_cmpl_final*>(raw_result);
+            if (final_res && final_res->is_updated) {
+                populate_chat_deltas_from_diffs(reply, final_res->oaicompat_msg_diffs);
+            }
+        };
+
+        // Process first result.
+        // When TASK_RESPONSE_TYPE_OAI_CHAT is used, the first token may
+        // produce a JSON array with a role-init element followed by the
+        // actual content element. We must only attach chat deltas to the
+        // content element — attaching to both would duplicate the first
+        // token since oaicompat_msg_diffs is the same for both.
         json first_res_json = first_result->to_json();
         if (first_res_json.is_array()) {
             for (const auto & res : first_res_json) {
-                std::string completion_text = res.value("content", "");
-
-                backend::Reply reply;
-                reply.set_message(completion_text);
-                int32_t tokens_predicted = res.value("tokens_predicted", 0);
-                reply.set_tokens(tokens_predicted);
-                int32_t tokens_evaluated = res.value("tokens_evaluated", 0);
-                reply.set_prompt_tokens(tokens_evaluated);
-
-                if (res.contains("timings")) {
-                    double timing_prompt_processing = res.at("timings").value("prompt_ms", 0.0);
-                    reply.set_timing_prompt_processing(timing_prompt_processing);
-                    double timing_token_generation = res.at("timings").value("predicted_ms", 0.0);
-                    reply.set_timing_token_generation(timing_token_generation);
+                auto reply = build_reply_from_json(res, first_result.get());
+                // Skip chat deltas for role-init elements (have "role" in
+                // delta but no content/reasoning diffs of their own).
+                bool is_role_init = res.contains("choices") && !res["choices"].empty() &&
+                                    res["choices"][0].value("delta", json::object()).contains("role");
+                if (!is_role_init) {
+                    attach_chat_deltas(reply, first_result.get());
                 }
-
-                // Extract and set logprobs if present
-                json logprobs_json = extract_logprobs_from_json(res);
-                if (!logprobs_json.empty() && !logprobs_json.is_null()) {
-                    std::string logprobs_str = logprobs_json.dump();
-                    reply.set_logprobs(logprobs_str);
-                }
-
                 writer->Write(reply);
             }
         } else {
-            std::string completion_text = first_res_json.value("content", "");
-
-            backend::Reply reply;
-            reply.set_message(completion_text);
-            int32_t tokens_predicted = first_res_json.value("tokens_predicted", 0);
-            reply.set_tokens(tokens_predicted);
-            int32_t tokens_evaluated = first_res_json.value("tokens_evaluated", 0);
-            reply.set_prompt_tokens(tokens_evaluated);
-
-            if (first_res_json.contains("timings")) {
-                double timing_prompt_processing = first_res_json.at("timings").value("prompt_ms", 0.0);
-                reply.set_timing_prompt_processing(timing_prompt_processing);
-                double timing_token_generation = first_res_json.at("timings").value("predicted_ms", 0.0);
-                reply.set_timing_token_generation(timing_token_generation);
-            }
-
-            // Extract and set logprobs if present
-            json logprobs_json = extract_logprobs_from_json(first_res_json);
-            if (!logprobs_json.empty() && !logprobs_json.is_null()) {
-                std::string logprobs_str = logprobs_json.dump();
-                reply.set_logprobs(logprobs_str);
-            }
-
+            auto reply = build_reply_from_json(first_res_json, first_result.get());
+            attach_chat_deltas(reply, first_result.get());
             writer->Write(reply);
         }
 
         // Process subsequent results
         while (rd.has_next()) {
-            // Check if context is cancelled before processing result
             if (context->IsCancelled()) {
                 break;
             }
 
             auto result = rd.next([&context]() { return context->IsCancelled(); });
             if (result == nullptr) {
-                // connection is closed
                 break;
             }
 
             json res_json = result->to_json();
             if (res_json.is_array()) {
                 for (const auto & res : res_json) {
-                    std::string completion_text = res.value("content", "");
-
-                    backend::Reply reply;
-                    reply.set_message(completion_text);
-                    int32_t tokens_predicted = res.value("tokens_predicted", 0);
-                    reply.set_tokens(tokens_predicted);
-                    int32_t tokens_evaluated = res.value("tokens_evaluated", 0);
-                    reply.set_prompt_tokens(tokens_evaluated);
-
-                    if (res.contains("timings")) {
-                        double timing_prompt_processing = res.at("timings").value("prompt_ms", 0.0);
-                        reply.set_timing_prompt_processing(timing_prompt_processing);
-                        double timing_token_generation = res.at("timings").value("predicted_ms", 0.0);
-                        reply.set_timing_token_generation(timing_token_generation);
+                    auto reply = build_reply_from_json(res, result.get());
+                    bool is_role_init = res.contains("choices") && !res["choices"].empty() &&
+                                        res["choices"][0].value("delta", json::object()).contains("role");
+                    if (!is_role_init) {
+                        attach_chat_deltas(reply, result.get());
                     }
-
-                    // Extract and set logprobs if present
-                    json logprobs_json = extract_logprobs_from_json(res);
-                    if (!logprobs_json.empty() && !logprobs_json.is_null()) {
-                        std::string logprobs_str = logprobs_json.dump();
-                        reply.set_logprobs(logprobs_str);
-                    }
-
                     writer->Write(reply);
                 }
             } else {
-                std::string completion_text = res_json.value("content", "");
-
-                backend::Reply reply;
-                reply.set_message(completion_text);
-                int32_t tokens_predicted = res_json.value("tokens_predicted", 0);
-                reply.set_tokens(tokens_predicted);
-                int32_t tokens_evaluated = res_json.value("tokens_evaluated", 0);
-                reply.set_prompt_tokens(tokens_evaluated);
-
-                if (res_json.contains("timings")) {
-                    double timing_prompt_processing = res_json.at("timings").value("prompt_ms", 0.0);
-                    reply.set_timing_prompt_processing(timing_prompt_processing);
-                    double timing_token_generation = res_json.at("timings").value("predicted_ms", 0.0);
-                    reply.set_timing_token_generation(timing_token_generation);
-                }
-
-                // Extract and set logprobs if present
-                json logprobs_json = extract_logprobs_from_json(res_json);
-                if (!logprobs_json.empty() && !logprobs_json.is_null()) {
-                    std::string logprobs_str = logprobs_json.dump();
-                    reply.set_logprobs(logprobs_str);
-                }
-
+                auto reply = build_reply_from_json(res_json, result.get());
+                attach_chat_deltas(reply, result.get());
                 writer->Write(reply);
             }
         }
@@ -1499,15 +2152,17 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status Predict(ServerContext* context, const backend::PredictOptions* request, backend::Reply* reply) {
-         if (!params_base_ptr) {
+    grpc::Status Predict(ServerContext* context, const backend::PredictOptions* request, backend::Reply* reply) override {
+         auto auth = checkAuth(context);
+         if (!auth.ok()) return auth;
+         if (params_base.model.path.empty()) {
              return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "Model not loaded");
          }
-         json data = parse_options(true, request, *params_base_ptr, ctx_server.get_llama_context());
+         json data = parse_options(true, request, params_base, ctx_server.get_llama_context());
 
         data["stream"] = false;
         //Raise error if embeddings is set to true
-        if (ctx_server.impl->params_base.embedding) {
+        if (params_base.embedding) {
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Embedding is not supported in Predict mode");
         }
         std::cout << "[PREDICT] Received result: " << data.dump(2) << std::endl;
@@ -1519,7 +2174,7 @@ public:
             std::string prompt_str;
             std::vector<raw_buffer> files; // Declare files early so it's accessible in both branches
             // Handle chat templates when UseTokenizerTemplate is enabled and Messages are provided
-            if (request->usetokenizertemplate() && request->messages_size() > 0 && ctx_server.impl->chat_templates != nullptr) {
+            if (request->usetokenizertemplate() && request->messages_size() > 0 && ctx_server.impl->chat_params.tmpls != nullptr) {
                 // Convert proto Messages to JSON format compatible with oaicompat_chat_params_parse
                 json body_json;
                 json messages_json = json::array();
@@ -1917,18 +2572,59 @@ public:
                     body_json["add_generation_prompt"] = data["add_generation_prompt"];
                 }
 
+                // Pass sampling parameters to body_json so oaicompat_chat_params_parse respects them
+                // and doesn't overwrite them with defaults in the returned parsed_data
+                if (data.contains("n_predict")) {
+                    body_json["max_tokens"] = data["n_predict"];
+                }
+                if (data.contains("ignore_eos")) {
+                    body_json["ignore_eos"] = data["ignore_eos"];
+                }
+                if (data.contains("stop")) {
+                    body_json["stop"] = data["stop"];
+                }
+                if (data.contains("temperature")) {
+                    body_json["temperature"] = data["temperature"];
+                }
+                if (data.contains("top_p")) {
+                    body_json["top_p"] = data["top_p"];
+                }
+                if (data.contains("frequency_penalty")) {
+                    body_json["frequency_penalty"] = data["frequency_penalty"];
+                }
+                if (data.contains("presence_penalty")) {
+                    body_json["presence_penalty"] = data["presence_penalty"];
+                }
+                if (data.contains("seed")) {
+                    body_json["seed"] = data["seed"];
+                }
+                if (data.contains("logit_bias")) {
+                    body_json["logit_bias"] = data["logit_bias"];
+                }
+                if (data.contains("top_k")) {
+                    body_json["top_k"] = data["top_k"];
+                }
+                if (data.contains("min_p")) {
+                    body_json["min_p"] = data["min_p"];
+                }
+
+                // Pass enable_thinking via chat_template_kwargs (where oaicompat_chat_params_parse reads it)
+                const auto& predict_metadata = request->metadata();
+                auto predict_et_it = predict_metadata.find("enable_thinking");
+                if (predict_et_it != predict_metadata.end()) {
+                    if (!body_json.contains("chat_template_kwargs")) {
+                        body_json["chat_template_kwargs"] = json::object();
+                    }
+                    body_json["chat_template_kwargs"]["enable_thinking"] = (predict_et_it->second == "true");
+                }
+
                 // Debug: Print full body_json before template processing (includes messages, tools, tool_choice, etc.)
                 SRV_DBG("[CONVERSATION DEBUG] Predict: Full body_json before oaicompat_chat_params_parse:\n%s\n", body_json.dump(2).c_str());
 
                 // Use the same approach as server.cpp: call oaicompat_chat_params_parse
                 // This handles all template application, grammar merging, etc. automatically
                 // Files extracted from multimodal content in messages will be added to the files vector
-                // Create parser options with current chat_templates to ensure tmpls is not null
-                oaicompat_parser_options parser_opt = ctx_server.impl->oai_parser_opt;
-                parser_opt.tmpls = ctx_server.impl->chat_templates.get(); // Ensure tmpls is set to current chat_templates
-                // Update allow_image and allow_audio based on current mctx state
-                parser_opt.allow_image = ctx_server.impl->mctx ? mtmd_support_vision(ctx_server.impl->mctx) : false;
-                parser_opt.allow_audio = ctx_server.impl->mctx ? mtmd_support_audio(ctx_server.impl->mctx) : false;
+                // chat_params already contains tmpls, allow_image, and allow_audio set during model loading
 
                 // Debug: Log tools before template processing
                 if (body_json.contains("tools")) {
@@ -1974,7 +2670,7 @@ public:
                     }
                 }
 
-                json parsed_data = oaicompat_chat_params_parse(body_json, parser_opt, files);
+                json parsed_data = oaicompat_chat_params_parse(body_json, ctx_server.impl->chat_params, files);
 
                 // Debug: Log tools after template processing
                 if (parsed_data.contains("tools")) {
@@ -2027,7 +2723,7 @@ public:
 
             // If not using chat templates, extract files from image_data/audio_data fields
             // (If using chat templates, files were already extracted by oaicompat_chat_params_parse)
-            if (!request->usetokenizertemplate() || request->messages_size() == 0 || ctx_server.impl->chat_templates == nullptr) {
+            if (!request->usetokenizertemplate() || request->messages_size() == 0 || ctx_server.impl->chat_params.tmpls == nullptr) {
                 const auto &images_data = data.find("image_data");
                 if (images_data != data.end() && images_data->is_array())
                 {
@@ -2073,13 +2769,16 @@ public:
 
                 task.tokens    = std::move(inputs[i]);
                 task.params           = server_task::params_from_json_cmpl(
-                        ctx_server.get_llama_context(),
-                        ctx_server.impl->params_base,
+                        ctx_server.impl->vocab,
+                        params_base,
+                        ctx_server.get_meta().slot_n_ctx,
+                        ctx_server.get_meta().logit_bias_eog,
                         data);
                 task.id_slot = json_value(data, "id_slot", -1);
 
-                // OAI-compat
-                task.params.res_type                 = TASK_RESPONSE_TYPE_NONE;
+                // OAI-compat: enable autoparser (PEG-based chat parsing) so that
+                // reasoning, tool calls, and content are classified into ChatDeltas.
+                task.params.res_type                 = TASK_RESPONSE_TYPE_OAI_CHAT;
                 task.params.oaicompat_cmpl_id         = completion_id;
                 // oaicompat_model is already populated by params_from_json_cmpl
 
@@ -2107,27 +2806,56 @@ public:
             std::cout << "[DEBUG] Received " << all_results.results.size() << " results" << std::endl;
             if (all_results.results.size() == 1) {
                 // single result
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(all_results.results[0].get()) != nullptr);
+                auto* final_res = dynamic_cast<server_task_result_cmpl_final*>(all_results.results[0].get());
+                GGML_ASSERT(final_res != nullptr);
                 json result_json = all_results.results[0]->to_json();
-                reply->set_message(result_json.value("content", ""));
 
-                int32_t tokens_predicted = result_json.value("tokens_predicted", 0);
+                // Handle both native format ({"content": "...", "tokens_predicted": N})
+                // and OAI chat format ({"choices": [{"message": {"content": "..."}}],
+                // "usage": {"completion_tokens": N, "prompt_tokens": N}}).
+                std::string completion_text;
+                int32_t tokens_predicted = 0;
+                int32_t tokens_evaluated = 0;
+
+                if (result_json.contains("choices")) {
+                    // OAI chat format
+                    const auto & choices = result_json.at("choices");
+                    if (!choices.empty()) {
+                        const auto & msg = choices[0].value("message", json::object());
+                        if (msg.contains("content") && !msg.at("content").is_null()) {
+                            completion_text = msg.at("content").get<std::string>();
+                        }
+                    }
+                    if (result_json.contains("usage")) {
+                        const auto & usage = result_json.at("usage");
+                        tokens_predicted = usage.value("completion_tokens", 0);
+                        tokens_evaluated = usage.value("prompt_tokens", 0);
+                    }
+                } else {
+                    // Native llama.cpp format
+                    completion_text = result_json.value("content", "");
+                    tokens_predicted = result_json.value("tokens_predicted", 0);
+                    tokens_evaluated = result_json.value("tokens_evaluated", 0);
+                }
+                reply->set_message(completion_text);
                 reply->set_tokens(tokens_predicted);
-                int32_t tokens_evaluated = result_json.value("tokens_evaluated", 0);
                 reply->set_prompt_tokens(tokens_evaluated);
 
+                // Timings: present in both formats as a top-level "timings" object
                 if (result_json.contains("timings")) {
-                    double timing_prompt_processing = result_json.at("timings").value("prompt_ms", 0.0);
-                    reply->set_timing_prompt_processing(timing_prompt_processing);
-                    double timing_token_generation = result_json.at("timings").value("predicted_ms", 0.0);
-                    reply->set_timing_token_generation(timing_token_generation);
+                    reply->set_timing_prompt_processing(result_json.at("timings").value("prompt_ms", 0.0));
+                    reply->set_timing_token_generation(result_json.at("timings").value("predicted_ms", 0.0));
                 }
 
-                // Extract and set logprobs if present
+                // Logprobs: extract_logprobs_from_json handles both formats
                 json logprobs_json = extract_logprobs_from_json(result_json);
                 if (!logprobs_json.empty() && !logprobs_json.is_null()) {
-                    std::string logprobs_str = logprobs_json.dump();
-                    reply->set_logprobs(logprobs_str);
+                    reply->set_logprobs(logprobs_json.dump());
+                }
+
+                // Populate chat deltas from the autoparser's final parsed message
+                if (final_res->is_updated) {
+                    populate_chat_deltas_from_final(*reply, final_res->oaicompat_msg);
                 }
 
             } else {
@@ -2138,7 +2866,20 @@ public:
                 for (auto & res : all_results.results) {
                     GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
                     json res_json = res->to_json();
-                    arr.push_back(res_json.value("content", ""));
+                    // Handle both native and OAI chat formats
+                    std::string result_content;
+                    if (res_json.contains("choices")) {
+                        const auto & choices = res_json.at("choices");
+                        if (!choices.empty()) {
+                            const auto & msg = choices[0].value("message", json::object());
+                            if (msg.contains("content") && !msg.at("content").is_null()) {
+                                result_content = msg.at("content").get<std::string>();
+                            }
+                        }
+                    } else {
+                        result_content = res_json.value("content", "");
+                    }
+                    arr.push_back(result_content);
 
                     // Extract logprobs for each result
                     json logprobs_json = extract_logprobs_from_json(res_json);
@@ -2169,11 +2910,13 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status Embedding(ServerContext* context, const backend::PredictOptions* request, backend::EmbeddingResult* embeddingResult) {
-        if (!params_base_ptr) {
+    grpc::Status Embedding(ServerContext* context, const backend::PredictOptions* request, backend::EmbeddingResult* embeddingResult) override {
+        auto auth = checkAuth(context);
+        if (!auth.ok()) return auth;
+        if (params_base.model.path.empty()) {
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "Model not loaded");
         }
-        json body = parse_options(false, request, *params_base_ptr, ctx_server.get_llama_context());
+        json body = parse_options(false, request, params_base, ctx_server.get_llama_context());
 
         body["stream"] = false;
 
@@ -2195,7 +2938,9 @@ public:
             }
         }
 
-        int embd_normalize = 2; // default to Euclidean/L2 norm
+        // Honor the load-time embd_normalize set via options:embd_normalize.
+        // -1 none, 0 max-abs, 1 taxicab, 2 L2 (default), >2 p-norm.
+        int embd_normalize = params_base.embd_normalize;
         // create and queue the task
         auto rd = ctx_server.get_response_reader();
         {
@@ -2264,8 +3009,8 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status Rerank(ServerContext* context, const backend::RerankRequest* request, backend::RerankResult* rerankResult) {
-        if (!ctx_server.impl->params_base.embedding || ctx_server.impl->params_base.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+    grpc::Status Rerank(ServerContext* context, const backend::RerankRequest* request, backend::RerankResult* rerankResult) override {
+        if (!params_base.embedding || params_base.pooling_type != LLAMA_POOLING_TYPE_RANK) {
             return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "This server does not support reranking. Start it with `--reranking` and without `--embedding`");
         }
 
@@ -2289,7 +3034,7 @@ public:
 
             tasks.reserve(documents.size());
             for (size_t i = 0; i < documents.size(); i++) {
-                auto tmp = format_prompt_rerank(ctx_server.impl->model, ctx_server.impl->vocab, ctx_server.impl->mctx, request->query(), documents[i]);
+                auto tmp = format_prompt_rerank(ctx_server.impl->model_tgt, ctx_server.impl->vocab, ctx_server.impl->mctx, request->query(), documents[i]);
                 server_task task = server_task(SERVER_TASK_TYPE_RERANK);
                 task.id = rd.queue_tasks.get_new_id();
                 task.index = i;
@@ -2350,11 +3095,13 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status TokenizeString(ServerContext* context, const backend::PredictOptions* request, backend::TokenizationResponse* response) {
-        if (!params_base_ptr) {
+    grpc::Status TokenizeString(ServerContext* context, const backend::PredictOptions* request, backend::TokenizationResponse* response) override {
+        auto auth = checkAuth(context);
+        if (!auth.ok()) return auth;
+        if (params_base.model.path.empty()) {
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "Model not loaded");
         }
-        json body = parse_options(false, request, *params_base_ptr, ctx_server.get_llama_context());
+        json body = parse_options(false, request, params_base, ctx_server.get_llama_context());
         body["stream"] = false;
 
         json tokens_response = json::array();
@@ -2373,7 +3120,7 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status GetMetrics(ServerContext* context, const backend::MetricsRequest* request, backend::MetricsResponse* response) {
+    grpc::Status GetMetrics(ServerContext* /*context*/, const backend::MetricsRequest* /*request*/, backend::MetricsResponse* response) override {
 
 // request slots data using task queue
         auto rd = ctx_server.get_response_reader();
@@ -2413,6 +3160,273 @@ public:
 
         return grpc::Status::OK;
     }
+
+    grpc::Status ModelMetadata(ServerContext* /*context*/, const backend::ModelOptions* /*request*/, backend::ModelMetadataResponse* response) override {
+        // Check if model is loaded
+        if (params_base.model.path.empty()) {
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "Model not loaded");
+        }
+
+        // Report the active multimodal media marker so the Go layer can emit the
+        // same string when rendering prompts outside the tokenizer-template path.
+        // Only meaningful when an mtmd context was initialized (vision/audio models).
+        if (ctx_server.impl->mctx != nullptr) {
+            response->set_media_marker(get_media_marker());
+        }
+
+        // Check if chat templates are initialized
+        if (ctx_server.impl->chat_params.tmpls == nullptr) {
+            // If templates are not initialized, we can't detect thinking support
+            // Return false as default
+            response->set_supports_thinking(false);
+            response->set_rendered_template("");
+            return grpc::Status::OK;
+        }
+
+        // Detect thinking support using llama.cpp's function
+        bool supports_thinking = common_chat_templates_support_enable_thinking(ctx_server.impl->chat_params.tmpls.get());
+        response->set_supports_thinking(supports_thinking);
+
+        // Render the template with enable_thinking=true so Go code can detect thinking tokens
+        // This allows reusing existing detection functions in Go
+        std::string rendered_template = "";
+        if (params_base.use_jinja) {
+            // Render the template with enable_thinking=true to see what the actual prompt looks like
+            common_chat_templates_inputs dummy_inputs;
+            common_chat_msg msg;
+            msg.role = "user";
+            msg.content = "test";
+            dummy_inputs.messages = {msg};
+            dummy_inputs.enable_thinking = true;
+            dummy_inputs.use_jinja = params_base.use_jinja;
+            
+            const auto rendered = common_chat_templates_apply(ctx_server.impl->chat_params.tmpls.get(), dummy_inputs);
+            rendered_template = rendered.prompt;
+        }
+        
+        response->set_rendered_template(rendered_template);
+
+        // Run differential template analysis to detect tool format markers
+        if (params_base.use_jinja) {
+            try {
+                // Get template source and reconstruct a common_chat_template for analysis
+                std::string tmpl_src = common_chat_templates_source(ctx_server.impl->chat_params.tmpls.get());
+                if (!tmpl_src.empty()) {
+                    const auto * vocab = llama_model_get_vocab(ctx_server.impl->model_tgt);
+                    std::string token_bos, token_eos;
+                    if (vocab) {
+                        auto bos_id = llama_vocab_bos(vocab);
+                        auto eos_id = llama_vocab_eos(vocab);
+                        if (bos_id != LLAMA_TOKEN_NULL) {
+                            token_bos = common_token_to_piece(vocab, bos_id, true);
+                        }
+                        if (eos_id != LLAMA_TOKEN_NULL) {
+                            token_eos = common_token_to_piece(vocab, eos_id, true);
+                        }
+                    }
+                    common_chat_template tmpl(tmpl_src, token_bos, token_eos);
+                    struct autoparser::autoparser ap;
+                    ap.analyze_template(tmpl);
+
+                    if (ap.analysis_complete && ap.tools.format.mode != autoparser::tool_format::NONE) {
+                        auto * tf = response->mutable_tool_format();
+
+                        // Format type
+                        switch (ap.tools.format.mode) {
+                            case autoparser::tool_format::JSON_NATIVE:
+                                tf->set_format_type("json_native");
+                                break;
+                            case autoparser::tool_format::TAG_WITH_JSON:
+                                tf->set_format_type("tag_with_json");
+                                break;
+                            case autoparser::tool_format::TAG_WITH_TAGGED:
+                                tf->set_format_type("tag_with_tagged");
+                                break;
+                            default:
+                                break;
+                        }
+
+                        // Tool section markers
+                        tf->set_section_start(ap.tools.format.section_start);
+                        tf->set_section_end(ap.tools.format.section_end);
+                        tf->set_per_call_start(ap.tools.format.per_call_start);
+                        tf->set_per_call_end(ap.tools.format.per_call_end);
+
+                        // Function markers
+                        tf->set_func_name_prefix(ap.tools.function.name_prefix);
+                        tf->set_func_name_suffix(ap.tools.function.name_suffix);
+                        tf->set_func_close(ap.tools.function.close);
+
+                        // Argument markers
+                        tf->set_arg_name_prefix(ap.tools.arguments.name_prefix);
+                        tf->set_arg_name_suffix(ap.tools.arguments.name_suffix);
+                        tf->set_arg_value_prefix(ap.tools.arguments.value_prefix);
+                        tf->set_arg_value_suffix(ap.tools.arguments.value_suffix);
+                        tf->set_arg_separator(ap.tools.arguments.separator);
+                        tf->set_args_start(ap.tools.arguments.start);
+                        tf->set_args_end(ap.tools.arguments.end);
+
+                        // JSON format fields
+                        tf->set_name_field(ap.tools.format.name_field);
+                        tf->set_args_field(ap.tools.format.args_field);
+                        tf->set_id_field(ap.tools.format.id_field);
+                        tf->set_fun_name_is_key(ap.tools.format.fun_name_is_key);
+                        tf->set_tools_array_wrapped(ap.tools.format.tools_array_wrapped);
+                        tf->set_function_field(ap.tools.format.function_field);
+
+                        tf->set_gen_id_field(ap.tools.format.gen_id_field);
+
+                        for (const auto & p : ap.tools.format.parameter_order) {
+                            tf->add_parameter_order(p);
+                        }
+
+                        // Call ID markers
+                        switch (ap.tools.call_id.pos) {
+                            case autoparser::call_id_position::NONE:
+                                tf->set_call_id_position("none");
+                                break;
+                            case autoparser::call_id_position::PRE_FUNC_NAME:
+                                tf->set_call_id_position("pre_func_name");
+                                break;
+                            case autoparser::call_id_position::BETWEEN_FUNC_AND_ARGS:
+                                tf->set_call_id_position("between_func_and_args");
+                                break;
+                            case autoparser::call_id_position::POST_ARGS:
+                                tf->set_call_id_position("post_args");
+                                break;
+                        }
+                        tf->set_call_id_prefix(ap.tools.call_id.prefix);
+                        tf->set_call_id_suffix(ap.tools.call_id.suffix);
+
+                        // Reasoning markers
+                        tf->set_reasoning_start(ap.reasoning.start);
+                        tf->set_reasoning_end(ap.reasoning.end);
+
+                        // Content markers
+                        tf->set_content_start(ap.content.start);
+                        tf->set_content_end(ap.content.end);
+                    }
+                }
+            } catch (const std::exception & e) {
+                SRV_WRN("ModelMetadata: failed to run autoparser analysis: %s\n", e.what());
+            }
+        }
+
+        return grpc::Status::OK;
+    }
+
+    // runTranscriptionAsCompletion implements OAI /v1/audio/transcriptions on
+    // top of the existing chat-completion + multimodal-audio pipeline, exactly
+    // the way upstream llama.cpp's server does it (see
+    // tools/server/server-context.cpp post_transcriptions_oai → forwards into
+    // handle_completions_impl with a single user message attaching the audio
+    // file via the mtmd marker).
+    //
+    // We synthesize a backend::PredictOptions with one user message
+    // ("Transcribe audio to text" + optional language hint) and the audio
+    // bytes attached via the existing PredictOptions.audios field, then
+    // delegate to our own Predict() handler. This keeps every multimodal
+    // codepath identical to the chat path and avoids duplicating ~700 lines
+    // of task-construction logic.
+    grpc::Status runTranscriptionAsCompletion(grpc::ServerContext* context,
+                                              const backend::TranscriptRequest* request,
+                                              backend::Reply* out_reply) {
+        if (params_base.model.path.empty()) {
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "Model not loaded");
+        }
+        if (request->dst().empty()) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "dst (audio file path) is required");
+        }
+
+        // Read audio bytes from the path LocalAI's HTTP layer wrote.
+        std::ifstream f(request->dst(), std::ios::binary);
+        if (!f.is_open()) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "failed to open audio file: " + request->dst());
+        }
+        std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(f)),
+                                          std::istreambuf_iterator<char>());
+        f.close();
+        if (bytes.empty()) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "audio file is empty: " + request->dst());
+        }
+
+        std::string b64 = base64_encode_bytes(bytes.data(), bytes.size());
+
+        // Build the same prompt upstream uses in convert_transcriptions_to_chatcmpl.
+        std::string user_prompt = "Transcribe audio to text";
+        if (!request->language().empty()) {
+            user_prompt += " (language: " + request->language() + ")";
+        }
+        if (!request->prompt().empty()) {
+            // Optional context hint from the caller.
+            user_prompt += "\n" + request->prompt();
+        }
+
+        backend::PredictOptions synthetic;
+        synthetic.set_usetokenizertemplate(true);
+        synthetic.set_temperature(request->temperature());
+        // Generation length: leave at 0 so parse_options uses -1 (model default).
+        // The model's stop tokens / EOS handle termination naturally for ASR.
+        backend::Message* msg = synthetic.add_messages();
+        msg->set_role("user");
+        msg->set_content(user_prompt);
+        synthetic.add_audios(b64);
+
+        return Predict(context, &synthetic, out_reply);
+    }
+
+    grpc::Status AudioTranscription(ServerContext* context,
+                                    const backend::TranscriptRequest* request,
+                                    backend::TranscriptResult* response) override {
+        auto auth = checkAuth(context);
+        if (!auth.ok()) return auth;
+
+        backend::Reply reply;
+        grpc::Status st = runTranscriptionAsCompletion(context, request, &reply);
+        if (!st.ok()) {
+            return st;
+        }
+        response->set_text(reply.message());
+        if (!request->language().empty()) {
+            response->set_language(request->language());
+        }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status AudioTranscriptionStream(ServerContext* context,
+                                          const backend::TranscriptRequest* request,
+                                          grpc::ServerWriter<backend::TranscriptStreamResponse>* writer) override {
+        auto auth = checkAuth(context);
+        if (!auth.ok()) return auth;
+
+        // Buffered streaming: run the transcription as a normal chat
+        // completion, then emit one delta + one final event. Real
+        // token-by-token streaming would require refactoring PredictStream's
+        // 700-line writer-coupled body; the HTTP/SSE contract is identical
+        // either way, and clients that only consume the assembled text don't
+        // notice the difference.
+        backend::Reply reply;
+        grpc::Status st = runTranscriptionAsCompletion(context, request, &reply);
+        if (!st.ok()) {
+            return st;
+        }
+
+        const std::string& text = reply.message();
+        if (!text.empty()) {
+            backend::TranscriptStreamResponse delta_chunk;
+            delta_chunk.set_delta(text);
+            writer->Write(delta_chunk);
+        }
+
+        backend::TranscriptStreamResponse final_chunk;
+        backend::TranscriptResult* final_result = final_chunk.mutable_final_result();
+        final_result->set_text(text);
+        if (!request->language().empty()) {
+            final_result->set_language(request->language());
+        }
+        writer->Write(final_chunk);
+        return grpc::Status::OK;
+    }
 };
 
 
@@ -2444,10 +3458,18 @@ int main(int argc, char** argv) {
 
     ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+
+    // Initialize bearer token auth if LOCALAI_GRPC_AUTH_TOKEN is set
+    const char* auth_token = std::getenv("LOCALAI_GRPC_AUTH_TOKEN");
+    if (auth_token != nullptr && auth_token[0] != '\0') {
+        g_grpc_auth_token = auth_token;
+        std::cout << "gRPC auth enabled via LOCALAI_GRPC_AUTH_TOKEN" << std::endl;
+    }
     builder.RegisterService(&service);
     builder.SetMaxMessageSize(50 * 1024 * 1024); // 50MB
     builder.SetMaxSendMessageSize(50 * 1024 * 1024); // 50MB
     builder.SetMaxReceiveMessageSize(50 * 1024 * 1024); // 50MB
+
     std::unique_ptr<Server> server(builder.BuildAndStart());
    // run the HTTP server in a thread - see comment below
     std::thread t([&]()

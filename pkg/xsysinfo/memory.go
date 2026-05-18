@@ -2,7 +2,6 @@ package xsysinfo
 
 import (
 	"github.com/mudler/memory"
-	"github.com/rs/zerolog/log"
 )
 
 // SystemRAMInfo contains system RAM usage information
@@ -25,7 +24,6 @@ func GetSystemRAMInfo() (*SystemRAMInfo, error) {
 	if total > 0 {
 		usagePercent = float64(used) / float64(total) * 100
 	}
-	log.Debug().Uint64("total", total).Uint64("used", used).Uint64("free", free).Float64("usage_percent", usagePercent).Msg("System RAM Info")
 	return &SystemRAMInfo{
 		Total:        total,
 		Used:         used,

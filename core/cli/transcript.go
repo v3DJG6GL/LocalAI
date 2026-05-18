@@ -2,31 +2,40 @@ package cli
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mudler/LocalAI/core/backend"
 	cliContext "github.com/mudler/LocalAI/core/cli/context"
 	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/gallery"
+	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/system"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 type TranscriptCMD struct {
-	Filename string `arg:""`
+	Filename string `arg:"" name:"file" help:"Audio file to transcribe" type:"path"`
 
-	Backend    string `short:"b" default:"whisper" help:"Backend to run the transcription model"`
-	Model      string `short:"m" required:"" help:"Model name to run the TTS"`
-	Language   string `short:"l" help:"Language of the audio file"`
-	Translate  bool   `short:"c" help:"Translate the transcription to english"`
-	Diarize    bool   `short:"d" help:"Mark speaker turns"`
-	Threads    int    `short:"t" default:"1" help:"Number of threads used for parallel computation"`
-	ModelsPath string `env:"LOCALAI_MODELS_PATH,MODELS_PATH" type:"path" default:"${basepath}/models" help:"Path containing models used for inferencing" group:"storage"`
+	Backend          string                                 `short:"b" default:"whisper" help:"Backend to run the transcription model"`
+	Model            string                                 `short:"m" required:"" help:"Model name to run the TTS"`
+	Language         string                                 `short:"l" help:"Language of the audio file"`
+	Translate        bool                                   `short:"c" help:"Translate the transcription to English"`
+	Diarize          bool                                   `short:"d" help:"Mark speaker turns"`
+	Threads          int                                    `short:"t" default:"1" help:"Number of threads used for parallel computation"`
+	BackendsPath     string                                 `env:"LOCALAI_BACKENDS_PATH,BACKENDS_PATH" type:"path" default:"${basepath}/backends" help:"Path containing backends used for inferencing" group:"storage"`
+	ModelsPath       string                                 `env:"LOCALAI_MODELS_PATH,MODELS_PATH" type:"path" default:"${basepath}/models" help:"Path containing models used for inferencing" group:"storage"`
+	BackendGalleries string                                 `env:"LOCALAI_BACKEND_GALLERIES,BACKEND_GALLERIES" help:"JSON list of backend galleries" group:"backends" default:"${backends}"`
+	Prompt           string                                 `short:"p" help:"Previous transcribed text or words that hint at what the model should expect"`
+	ResponseFormat   schema.TranscriptionResponseFormatType `short:"f" default:"" help:"Response format for Whisper models, can be one of (txt, lrc, srt, vtt, json, verbose_json)"`
+	PrettyPrint      bool                                   `help:"Used with response_format json or verbose_json for pretty printing"`
 }
 
 func (t *TranscriptCMD) Run(ctx *cliContext.Context) error {
 	systemState, err := system.GetSystemState(
+		system.WithBackendPath(t.BackendsPath),
 		system.WithModelPath(t.ModelsPath),
 	)
 	if err != nil {
@@ -39,13 +48,18 @@ func (t *TranscriptCMD) Run(ctx *cliContext.Context) error {
 
 	cl := config.NewModelConfigLoader(t.ModelsPath)
 	ml := model.NewModelLoader(systemState)
+
+	if err := gallery.RegisterBackends(systemState, ml); err != nil {
+		xlog.Error("error registering external backends", "error", err)
+	}
+
 	if err := cl.LoadModelConfigsFromPath(t.ModelsPath); err != nil {
 		return err
 	}
 
 	c, exists := cl.GetModelConfig(t.Model)
 	if !exists {
-		return errors.New("model not found")
+		return fmt.Errorf("model %q not found. Run 'local-ai models list' to see available models, or install one with 'local-ai models install <model>'. See https://localai.io/models/ for more information", t.Model)
 	}
 
 	c.Threads = &t.Threads
@@ -53,16 +67,71 @@ func (t *TranscriptCMD) Run(ctx *cliContext.Context) error {
 	defer func() {
 		err := ml.StopAllGRPC()
 		if err != nil {
-			log.Error().Err(err).Msg("unable to stop all grpc processes")
+			xlog.Error("unable to stop all grpc processes", "error", err)
 		}
 	}()
 
-	tr, err := backend.ModelTranscription(t.Filename, t.Language, t.Translate, t.Diarize, ml, c, opts)
+	tr, err := backend.ModelTranscription(context.Background(), t.Filename, t.Language, t.Translate, t.Diarize, t.Prompt, ml, c, opts)
 	if err != nil {
 		return err
 	}
-	for _, segment := range tr.Segments {
-		fmt.Println(segment.Start.String(), "-", segment.Text)
+
+	switch t.ResponseFormat {
+	case schema.TranscriptionResponseFormatLrc, schema.TranscriptionResponseFormatSrt, schema.TranscriptionResponseFormatVtt, schema.TranscriptionResponseFormatText:
+		fmt.Println(schema.TranscriptionResponse(tr, t.ResponseFormat))
+	case schema.TranscriptionResponseFormatJson:
+		tr.Segments = nil
+		tr.Words = nil
+		fallthrough
+	case schema.TranscriptionResponseFormatJsonVerbose:
+		trs := schema.TranscriptionResultSeconds{
+			Text:     tr.Text,
+			Language: tr.Language,
+			Duration: tr.Duration,
+			Words:    []schema.TranscriptionWordSeconds{},
+			Segments: []schema.TranscriptionSegmentSeconds{},
+		}
+		for _, word := range(tr.Words) {
+			trs.Words = append(trs.Words, schema.TranscriptionWordSeconds{
+				Start: word.Start.Seconds(),
+				End:   word.End.Seconds(),
+				Text:  word.Text,
+			})
+		}
+		for _, seg := range(tr.Segments) {
+			segWords := []schema.TranscriptionWordSeconds{}
+			for _, word := range(seg.Words) {
+				segWords = append(segWords, schema.TranscriptionWordSeconds{
+					Start: word.Start.Seconds(),
+					End:   word.End.Seconds(),
+					Text:  word.Text,
+				})
+			}
+			trs.Segments = append(trs.Segments, schema.TranscriptionSegmentSeconds{
+			  Id:      seg.Id,
+				Start:   seg.Start.Seconds(),
+				End:     seg.End.Seconds(),
+				Text:    seg.Text,
+				Tokens:  seg.Tokens,
+				Speaker: seg.Speaker,
+				Words:   segWords,
+			})
+		}
+		var mtr []byte
+		var err error
+		if t.PrettyPrint {
+			mtr, err = json.MarshalIndent(trs, "", "    ")
+		} else {
+			mtr, err = json.Marshal(trs)
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(mtr))
+	default:
+		for _, segment := range tr.Segments {
+			fmt.Println(segment.Start.String(), "-", strings.TrimSpace(segment.Text))
+		}
 	}
 	return nil
 }

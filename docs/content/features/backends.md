@@ -1,5 +1,5 @@
 ---
-title: "⚙️ Backends"
+title: "Backends"
 description: "Learn how to use, manage, and develop backends in LocalAI"
 weight: 4
 url: "/backends/"
@@ -94,7 +94,7 @@ Your backend container should:
 For getting started, see the available backends in LocalAI here: https://github.com/mudler/LocalAI/tree/master/backend . 
 
 - For Python based backends there is a template that can be used as starting point: https://github.com/mudler/LocalAI/tree/master/backend/python/common/template . 
-- For Golang based backends, you can see the `bark-cpp` backend as an example: https://github.com/mudler/LocalAI/tree/master/backend/go/bark-cpp
+- For Golang based backends, you can see the `piper` backend as an example: https://github.com/mudler/LocalAI/tree/master/backend/go/piper
 - For C++ based backends, you can see the `llama-cpp` backend as an example: https://github.com/mudler/LocalAI/tree/master/backend/cpp/llama-cpp
 
 ### Publishing Your Backend
@@ -122,3 +122,4 @@ LocalAI supports various types of backends:
 - **Diffusion Backends**: For image generation
 - **TTS Backends**: For text-to-speech conversion
 - **Whisper Backends**: For speech-to-text conversion
+- **Sound Generation Backends**: For music and audio generation (e.g., ACE-Step)

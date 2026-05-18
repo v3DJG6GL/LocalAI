@@ -46,16 +46,14 @@ The backend system provides language-specific Dockerfiles that handle the build 
 - **vllm**: High-performance LLM inference
 - **mlx**: Apple Silicon optimization
 - **diffusers**: Stable Diffusion models
-- **Audio**: bark, coqui, faster-whisper, kitten-tts
+- **Audio**: coqui, faster-whisper, kitten-tts
 - **Vision**: mlx-vlm, rfdetr
 - **Specialized**: rerankers, chatterbox, kokoro
 
 #### Go Backends (`go/`)
 - **whisper**: OpenAI Whisper speech recognition in Go with GGML cpp backend (whisper.cpp)
 - **stablediffusion-ggml**: Stable Diffusion in Go with GGML Cpp backend
-- **huggingface**: Hugging Face model integration
 - **piper**: Text-to-speech synthesis Golang with C bindings using rhaspy/piper
-- **bark-cpp**: Bark TTS models Golang with Cpp bindings
 - **local-store**: Vector storage backend
 
 #### C++ Backends (`cpp/`)
@@ -65,7 +63,7 @@ The backend system provides language-specific Dockerfiles that handle the build 
 ## Hardware Acceleration Support
 
 ### CUDA (NVIDIA)
-- **Versions**: CUDA 11.x, 12.x
+- **Versions**: CUDA 12.x, 13.x
 - **Features**: cuBLAS, cuDNN, TensorRT optimization
 - **Targets**: x86_64, ARM64 (Jetson)
 
@@ -132,8 +130,7 @@ For ARM64/Mac builds, docker can't be used, and the makefile in the respective b
 ### Build Types
 
 - **`cpu`**: CPU-only optimization
-- **`cublas11`**: CUDA 11.x with cuBLAS
-- **`cublas12`**: CUDA 12.x with cuBLAS
+- **`cublas12`**, **`cublas13`**: CUDA 12.x, 13.x with cuBLAS
 - **`hipblas`**: ROCm with rocBLAS
 - **`intel`**: Intel oneAPI optimization
 - **`vulkan`**: Vulkan-based acceleration

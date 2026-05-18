@@ -1,12 +1,13 @@
 package config
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 
@@ -14,7 +15,7 @@ import (
 	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/pkg/downloader"
 	"github.com/mudler/LocalAI/pkg/utils"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 	"gopkg.in/yaml.v3"
 )
 
@@ -76,42 +77,37 @@ func (lo *LoadOptions) Apply(options ...ConfigLoaderOption) {
 	}
 }
 
-// TODO: either in the next PR or the next commit, I want to merge these down into a single function that looks at the first few characters of the file to determine if we need to deserialize to []BackendConfig or BackendConfig
-func readMultipleModelConfigsFromFile(file string, opts ...ConfigLoaderOption) ([]*ModelConfig, error) {
-	c := &[]*ModelConfig{}
+// readModelConfigsFromFile reads a config file that may contain either a single
+// ModelConfig or an array of ModelConfigs. It tries to unmarshal as an array first,
+// then falls back to a single config if that fails.
+func readModelConfigsFromFile(file string, opts ...ConfigLoaderOption) ([]*ModelConfig, error) {
 	f, err := os.ReadFile(file)
 	if err != nil {
-		return nil, fmt.Errorf("readMultipleModelConfigsFromFile cannot read config file %q: %w", file, err)
-	}
-	if err := yaml.Unmarshal(f, c); err != nil {
-		return nil, fmt.Errorf("readMultipleModelConfigsFromFile cannot unmarshal config file %q: %w", file, err)
+		return nil, fmt.Errorf("readModelConfigsFromFile cannot read config file %q: %w", file, err)
 	}
 
-	for _, cc := range *c {
-		cc.modelConfigFile = file
-		cc.SetDefaults(opts...)
+	// Try to unmarshal as array first
+	var configs []*ModelConfig
+	if err := yaml.Unmarshal(f, &configs); err == nil && len(configs) > 0 {
+		for _, cc := range configs {
+			cc.modelConfigFile = file
+			cc.SetDefaults(opts...)
+			cc.syncKnownUsecasesFromString()
+		}
+		return configs, nil
 	}
 
-	return *c, nil
-}
-
-func readModelConfigFromFile(file string, opts ...ConfigLoaderOption) (*ModelConfig, error) {
-	lo := &LoadOptions{}
-	lo.Apply(opts...)
-
+	// Fall back to single config
 	c := &ModelConfig{}
-	f, err := os.ReadFile(file)
-	if err != nil {
-		return nil, fmt.Errorf("readModelConfigFromFile cannot read config file %q: %w", file, err)
-	}
 	if err := yaml.Unmarshal(f, c); err != nil {
-		return nil, fmt.Errorf("readModelConfigFromFile cannot unmarshal config file %q: %w", file, err)
+		return nil, fmt.Errorf("readModelConfigsFromFile cannot unmarshal config file %q: %w", file, err)
 	}
-
-	c.SetDefaults(opts...)
 
 	c.modelConfigFile = file
-	return c, nil
+	c.syncKnownUsecasesFromString()
+	c.SetDefaults(opts...)
+
+	return []*ModelConfig{c}, nil
 }
 
 // Load a config file for a model
@@ -163,14 +159,16 @@ func (bcl *ModelConfigLoader) LoadModelConfigFileByNameDefaultOptions(modelName 
 func (bcl *ModelConfigLoader) LoadMultipleModelConfigsSingleFile(file string, opts ...ConfigLoaderOption) error {
 	bcl.Lock()
 	defer bcl.Unlock()
-	c, err := readMultipleModelConfigsFromFile(file, opts...)
+	c, err := readModelConfigsFromFile(file, opts...)
 	if err != nil {
 		return fmt.Errorf("cannot load config file: %w", err)
 	}
 
 	for _, cc := range c {
-		if valid, _ := cc.Validate(); valid {
+		if valid, err := cc.Validate(); valid {
 			bcl.configs[cc.Name] = *cc
+		} else {
+			xlog.Warn("skipping invalid model config", "name", cc.Name, "error", err)
 		}
 	}
 	return nil
@@ -179,15 +177,25 @@ func (bcl *ModelConfigLoader) LoadMultipleModelConfigsSingleFile(file string, op
 func (bcl *ModelConfigLoader) ReadModelConfig(file string, opts ...ConfigLoaderOption) error {
 	bcl.Lock()
 	defer bcl.Unlock()
-	c, err := readModelConfigFromFile(file, opts...)
+	configs, err := readModelConfigsFromFile(file, opts...)
 	if err != nil {
 		return fmt.Errorf("ReadModelConfig cannot read config file %q: %w", file, err)
 	}
+	if len(configs) == 0 {
+		return fmt.Errorf("ReadModelConfig: no configs found in file %q", file)
+	}
+	if len(configs) > 1 {
+		xlog.Warn("ReadModelConig: read more than one config from file, only using first", "file", file, "configs", len(configs))
+	}
 
-	if valid, _ := c.Validate(); valid {
+	c := configs[0]
+	if valid, err := c.Validate(); valid {
 		bcl.configs[c.Name] = *c
 	} else {
-		return fmt.Errorf("config is not valid")
+		if err != nil {
+			return fmt.Errorf("model config %q is not valid: %w. Ensure the YAML file has a valid 'name' field and correct syntax. See https://localai.io/docs/getting-started/customize-model/ for config reference", file, err)
+		}
+		return fmt.Errorf("model config %q is not valid. Ensure the YAML file has a valid 'name' field and correct syntax. See https://localai.io/docs/getting-started/customize-model/ for config reference", file)
 	}
 
 	return nil
@@ -208,8 +216,8 @@ func (bcl *ModelConfigLoader) GetAllModelsConfigs() []ModelConfig {
 		res = append(res, v)
 	}
 
-	sort.SliceStable(res, func(i, j int) bool {
-		return res[i].Name < res[j].Name
+	slices.SortStableFunc(res, func(a, b ModelConfig) int {
+		return cmp.Compare(a.Name, b.Name)
 	})
 
 	return res
@@ -241,6 +249,51 @@ func (bcl *ModelConfigLoader) RemoveModelConfig(m string) {
 	delete(bcl.configs, m)
 }
 
+// GetModelsConflictingWith returns the names of every other configured (and
+// not-disabled) model that shares at least one concurrency group with the
+// named model. Returns nil if the named model has no groups, is unknown, or
+// has no peers in any of its groups. The result excludes the queried name.
+func (bcl *ModelConfigLoader) GetModelsConflictingWith(name string) []string {
+	bcl.Lock()
+	defer bcl.Unlock()
+	target, ok := bcl.configs[name]
+	if !ok {
+		return nil
+	}
+	targetGroups := target.GetConcurrencyGroups()
+	if len(targetGroups) == 0 {
+		return nil
+	}
+	var conflicts []string
+	for n, cfg := range bcl.configs {
+		if n == name || cfg.IsDisabled() {
+			continue
+		}
+		other := cfg.GetConcurrencyGroups()
+		if len(other) == 0 {
+			continue
+		}
+		for _, g := range targetGroups {
+			if slices.Contains(other, g) {
+				conflicts = append(conflicts, n)
+				break
+			}
+		}
+	}
+	return conflicts
+}
+
+// UpdateModelConfig updates an existing model config in the loader.
+// This is useful for updating runtime-detected properties like thinking support.
+func (bcl *ModelConfigLoader) UpdateModelConfig(m string, updater func(*ModelConfig)) {
+	bcl.Lock()
+	defer bcl.Unlock()
+	if cfg, exists := bcl.configs[m]; exists {
+		updater(&cfg)
+		bcl.configs[m] = cfg
+	}
+}
+
 // Preload prepare models if they are not local but url or huggingface repositories
 func (bcl *ModelConfigLoader) Preload(modelPath string) error {
 	bcl.Lock()
@@ -250,7 +303,7 @@ func (bcl *ModelConfigLoader) Preload(modelPath string) error {
 		utils.DisplayDownloadFunction(fileName, current, total, percent)
 	}
 
-	log.Info().Msgf("Preloading models from %s", modelPath)
+	xlog.Info("Preloading models", "path", modelPath)
 
 	renderMode := "dark"
 	if os.Getenv("COLOR") != "" {
@@ -270,7 +323,7 @@ func (bcl *ModelConfigLoader) Preload(modelPath string) error {
 
 		// Download files and verify their SHA
 		for i, file := range config.DownloadFiles {
-			log.Debug().Msgf("Checking %q exists and matches SHA", file.Filename)
+			xlog.Debug("Checking file exists and matches SHA", "filename", file.Filename)
 
 			if err := utils.VerifyPath(file.Filename, modelPath); err != nil {
 				return err
@@ -354,20 +407,28 @@ func (bcl *ModelConfigLoader) LoadModelConfigsFromPath(path string, opts ...Conf
 		files = append(files, info)
 	}
 	for _, file := range files {
-		// Skip templates, YAML and .keep files
-		if !strings.Contains(file.Name(), ".yaml") && !strings.Contains(file.Name(), ".yml") ||
-			strings.HasPrefix(file.Name(), ".") {
+		// Only load real YAML config files and ignore dotfiles or backup variants
+		ext := strings.ToLower(filepath.Ext(file.Name()))
+		if (ext != ".yaml" && ext != ".yml") || strings.HasPrefix(file.Name(), ".") {
 			continue
 		}
-		c, err := readModelConfigFromFile(filepath.Join(path, file.Name()), opts...)
+
+		filePath := filepath.Join(path, file.Name())
+
+		// Read config(s) - handles both single and array formats
+		configs, err := readModelConfigsFromFile(filePath, opts...)
 		if err != nil {
-			log.Error().Err(err).Str("File Name", file.Name()).Msgf("LoadModelConfigsFromPath cannot read config file")
+			xlog.Error("LoadModelConfigsFromPath cannot read config file", "error", err, "File Name", file.Name())
 			continue
 		}
-		if valid, _ := c.Validate(); valid {
-			bcl.configs[c.Name] = *c
-		} else {
-			log.Error().Err(err).Str("Name", c.Name).Msgf("config is not valid")
+
+		// Validate and store each config
+		for _, c := range configs {
+			if valid, validationErr := c.Validate(); valid {
+				bcl.configs[c.Name] = *c
+			} else {
+				xlog.Error("config is not valid", "error", validationErr, "Name", c.Name)
+			}
 		}
 	}
 

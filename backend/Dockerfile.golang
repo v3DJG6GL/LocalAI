@@ -1,4 +1,6 @@
-ARG BASE_IMAGE=ubuntu:22.04
+ARG BASE_IMAGE=ubuntu:24.04
+ARG APT_MIRROR=""
+ARG APT_PORTS_MIRROR=""
 
 FROM ${BASE_IMAGE} AS builder
 ARG BACKEND=rerankers
@@ -12,17 +14,35 @@ ENV CUDA_MINOR_VERSION=${CUDA_MINOR_VERSION}
 ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 ARG TARGETVARIANT
-ARG GO_VERSION=1.22.6
-ARG UBUNTU_VERSION=2204
+ARG GO_VERSION=1.25.4
+ARG UBUNTU_VERSION=2404
+ARG AMDGPU_TARGETS
+ENV AMDGPU_TARGETS=${AMDGPU_TARGETS}
+ARG APT_MIRROR
+ARG APT_PORTS_MIRROR
 
-RUN apt-get update && \
+# gcc-14 is the default on noble (ubuntu:24.04) but absent from jammy
+# (the L4T jetpack r36.4.0 base). LocalVQE specifically needs it; the
+# other Go backends compile fine with the default gcc shipped via
+# build-essential. So: try gcc-14 from the configured repos, fall back
+# gracefully when it's not available so jammy-based builds don't fail
+# at the apt step.
+RUN --mount=type=bind,source=.docker/apt-mirror.sh,target=/usr/local/sbin/apt-mirror \
+    APT_MIRROR="${APT_MIRROR}" APT_PORTS_MIRROR="${APT_PORTS_MIRROR}" sh /usr/local/sbin/apt-mirror && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         git ccache \
         ca-certificates \
-        make cmake wget \
+        make cmake wget libopenblas-dev \
         curl unzip \
         libssl-dev && \
+    if apt-cache show gcc-14 >/dev/null 2>&1 && apt-cache show g++-14 >/dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends gcc-14 g++-14 && \
+        update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-14 \
+            --slave /usr/bin/gcov gcov /usr/bin/gcov-14; \
+    fi && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -40,11 +60,45 @@ RUN <<EOT bash
         apt-get update && \
         apt-get install -y  --no-install-recommends \
             software-properties-common pciutils wget gpg-agent && \
-        wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | apt-key add - && \
-        wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list && \
-        apt-get update && \
-        apt-get install -y \
-            vulkan-sdk && \
+        apt-get install -y libglm-dev cmake libxcb-dri3-0 libxcb-present0 libpciaccess0 \
+            libpng-dev libxcb-keysyms1-dev libxcb-dri3-dev libx11-dev g++ gcc \
+            libwayland-dev libxrandr-dev libxcb-randr0-dev libxcb-ewmh-dev \
+            git python-is-python3 bison libx11-xcb-dev liblz4-dev libzstd-dev \
+            ocaml-core ninja-build pkg-config libxml2-dev wayland-protocols python3-jsonschema \
+            clang-format qtbase5-dev qt6-base-dev libxcb-glx0-dev sudo xz-utils
+        if [ "amd64" = "$TARGETARCH" ]; then
+            wget "https://sdk.lunarg.com/sdk/download/1.4.335.0/linux/vulkansdk-linux-x86_64-1.4.335.0.tar.xz" && \
+            tar -xf vulkansdk-linux-x86_64-1.4.335.0.tar.xz && \
+            rm vulkansdk-linux-x86_64-1.4.335.0.tar.xz && \
+            mkdir -p /opt/vulkan-sdk && \
+            mv 1.4.335.0 /opt/vulkan-sdk/ && \
+            cd /opt/vulkan-sdk/1.4.335.0 && \
+            ./vulkansdk --no-deps --maxjobs \
+                vulkan-loader \
+                vulkan-validationlayers \
+                vulkan-extensionlayer \
+                vulkan-tools \
+                shaderc && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/bin/* /usr/bin/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/lib/* /usr/lib/x86_64-linux-gnu/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/include/* /usr/include/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/share/* /usr/share/ && \
+            rm -rf /opt/vulkan-sdk
+        fi
+        if [ "arm64" = "$TARGETARCH" ]; then
+            mkdir vulkan && cd vulkan && \
+            curl -L -o vulkan-sdk.tar.xz https://github.com/mudler/vulkan-sdk-arm/releases/download/1.4.335.0/vulkansdk-ubuntu-24.04-arm-1.4.335.0.tar.xz && \
+            tar -xvf vulkan-sdk.tar.xz && \
+            rm vulkan-sdk.tar.xz && \
+            cd 1.4.335.0 && \
+            cp -rfv aarch64/bin/* /usr/bin/ && \
+            cp -rfv aarch64/lib/* /usr/lib/aarch64-linux-gnu/ && \
+            cp -rfv aarch64/include/* /usr/include/ && \
+            cp -rfv aarch64/share/* /usr/share/ && \
+            cd ../.. && \
+            rm -rf vulkan
+        fi
+        ldconfig && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/*
     fi
@@ -113,6 +167,7 @@ RUN if [ "${BUILD_TYPE}" = "hipblas" ] && [ "${SKIP_DRIVERS}" = "false" ]; then 
         apt-get update && \
         apt-get install -y --no-install-recommends \
             hipblas-dev \
+            hipblaslt-dev \
             rocblas-dev && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/* && \
@@ -146,7 +201,14 @@ RUN <<EOT bash
     fi
 EOT
 
+RUN if [ "${BACKEND}" = "opus" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends libopus-dev pkg-config && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*; \
+fi
+
 COPY . /LocalAI
+
+RUN git config --global --add safe.directory /LocalAI
 
 RUN cd /LocalAI && make protogen-go && make -C /LocalAI/backend/go/${BACKEND} build
 

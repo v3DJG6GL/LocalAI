@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"time"
 )
@@ -13,11 +13,11 @@ func runSyntheticMode() error {
 	generator := NewSyntheticDataGenerator()
 
 	// Generate a random number of synthetic models (1-3)
-	numModels := generator.rand.Intn(3) + 1
+	numModels := generator.rand.IntN(3) + 1
 	fmt.Printf("Generating %d synthetic models for testing...\n", numModels)
 
 	var models []ProcessedModel
-	for i := 0; i < numModels; i++ {
+	for range numModels {
 		model := generator.GenerateProcessedModel()
 		models = append(models, model)
 		fmt.Printf("Generated synthetic model: %s\n", model.ModelID)
@@ -42,14 +42,14 @@ type SyntheticDataGenerator struct {
 // NewSyntheticDataGenerator creates a new synthetic data generator
 func NewSyntheticDataGenerator() *SyntheticDataGenerator {
 	return &SyntheticDataGenerator{
-		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+		rand: rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0)),
 	}
 }
 
 // GenerateProcessedModelFile creates a synthetic ProcessedModelFile
 func (g *SyntheticDataGenerator) GenerateProcessedModelFile() ProcessedModelFile {
 	fileTypes := []string{"model", "readme", "other"}
-	fileType := fileTypes[g.rand.Intn(len(fileTypes))]
+	fileType := fileTypes[g.rand.IntN(len(fileTypes))]
 
 	var path string
 	var isReadme bool
@@ -68,7 +68,7 @@ func (g *SyntheticDataGenerator) GenerateProcessedModelFile() ProcessedModelFile
 
 	return ProcessedModelFile{
 		Path:     path,
-		Size:     int64(g.rand.Intn(1000000000) + 1000000), // 1MB to 1GB
+		Size:     int64(g.rand.IntN(1000000000) + 1000000), // 1MB to 1GB
 		SHA256:   g.randomSHA256(),
 		IsReadme: isReadme,
 		FileType: fileType,
@@ -80,19 +80,19 @@ func (g *SyntheticDataGenerator) GenerateProcessedModel() ProcessedModel {
 	authors := []string{"microsoft", "meta", "google", "openai", "anthropic", "mistralai", "huggingface"}
 	modelNames := []string{"llama", "gpt", "claude", "mistral", "gemma", "phi", "qwen", "codellama"}
 
-	author := authors[g.rand.Intn(len(authors))]
-	modelName := modelNames[g.rand.Intn(len(modelNames))]
+	author := authors[g.rand.IntN(len(authors))]
+	modelName := modelNames[g.rand.IntN(len(modelNames))]
 	modelID := fmt.Sprintf("%s/%s-%s", author, modelName, g.randomString(6))
 
 	// Generate files
-	numFiles := g.rand.Intn(5) + 2 // 2-6 files
+	numFiles := g.rand.IntN(5) + 2 // 2-6 files
 	files := make([]ProcessedModelFile, numFiles)
 
 	// Ensure at least one model file and one readme
 	hasModelFile := false
 	hasReadme := false
 
-	for i := 0; i < numFiles; i++ {
+	for i := range numFiles {
 		files[i] = g.GenerateProcessedModelFile()
 		if files[i].FileType == "model" {
 			hasModelFile = true
@@ -138,10 +138,29 @@ func (g *SyntheticDataGenerator) GenerateProcessedModel() ProcessedModel {
 
 	readmeContent := g.generateReadmeContent(modelName, author)
 
+	// Generate sample metadata
+	licenses := []string{"apache-2.0", "mit", "llama2", "gpl-3.0", "bsd", ""}
+	license := licenses[g.rand.IntN(len(licenses))]
+
+	sampleTags := []string{"llm", "gguf", "gpu", "cpu", "text-to-text", "chat", "instruction-tuned"}
+	numTags := g.rand.IntN(4) + 3 // 3-6 tags
+	tags := make([]string, numTags)
+	for i := range numTags {
+		tags[i] = sampleTags[g.rand.IntN(len(sampleTags))]
+	}
+	// Remove duplicates
+	tags = g.removeDuplicates(tags)
+
+	// Optionally include icon (50% chance)
+	icon := ""
+	if g.rand.IntN(2) == 0 {
+		icon = fmt.Sprintf("https://cdn-avatars.huggingface.co/v1/production/uploads/%s.png", g.randomString(24))
+	}
+
 	return ProcessedModel{
 		ModelID:                 modelID,
 		Author:                  author,
-		Downloads:               g.rand.Intn(1000000) + 1000,
+		Downloads:               g.rand.IntN(1000000) + 1000,
 		LastModified:            g.randomDate(),
 		Files:                   files,
 		PreferredModelFile:      preferredModelFile,
@@ -150,6 +169,9 @@ func (g *SyntheticDataGenerator) GenerateProcessedModel() ProcessedModel {
 		ReadmeContentPreview:    truncateString(readmeContent, 200),
 		QuantizationPreferences: []string{"Q4_K_M", "Q4_K_S", "Q3_K_M", "Q2_K"},
 		ProcessingError:         "",
+		Tags:                    tags,
+		License:                 license,
+		Icon:                    icon,
 	}
 }
 
@@ -158,7 +180,7 @@ func (g *SyntheticDataGenerator) randomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, length)
 	for i := range b {
-		b[i] = charset[g.rand.Intn(len(charset))]
+		b[i] = charset[g.rand.IntN(len(charset))]
 	}
 	return string(b)
 }
@@ -167,16 +189,28 @@ func (g *SyntheticDataGenerator) randomSHA256() string {
 	const charset = "0123456789abcdef"
 	b := make([]byte, 64)
 	for i := range b {
-		b[i] = charset[g.rand.Intn(len(charset))]
+		b[i] = charset[g.rand.IntN(len(charset))]
 	}
 	return string(b)
 }
 
 func (g *SyntheticDataGenerator) randomDate() string {
 	now := time.Now()
-	daysAgo := g.rand.Intn(365) // Random date within last year
+	daysAgo := g.rand.IntN(365) // Random date within last year
 	pastDate := now.AddDate(0, 0, -daysAgo)
 	return pastDate.Format("2006-01-02T15:04:05.000Z")
+}
+
+func (g *SyntheticDataGenerator) removeDuplicates(slice []string) []string {
+	keys := make(map[string]bool)
+	result := []string{}
+	for _, item := range slice {
+		if !keys[item] {
+			keys[item] = true
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func (g *SyntheticDataGenerator) generateReadmeContent(modelName, author string) string {
@@ -186,5 +220,5 @@ func (g *SyntheticDataGenerator) generateReadmeContent(modelName, author string)
 		fmt.Sprintf("# %s Language Model\n\nDeveloped by %s, this model represents state-of-the-art performance in natural language understanding and generation.\n\n## Key Features\n\n- Multilingual support\n- Context-aware responses\n- Efficient memory usage\n- Fast inference speed\n\n## Applications\n\n- Chatbots and virtual assistants\n- Content generation\n- Code completion\n- Educational tools", strings.Title(modelName), author),
 	}
 
-	return templates[g.rand.Intn(len(templates))]
+	return templates[g.rand.IntN(len(templates))]
 }

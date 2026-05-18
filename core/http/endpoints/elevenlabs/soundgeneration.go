@@ -8,12 +8,14 @@ import (
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/pkg/audio"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // SoundGenerationEndpoint is the ElevenLabs SoundGeneration endpoint https://elevenlabs.io/docs/api-reference/sound-generation
 // @Summary Generates audio from the input text.
+// @Tags audio
 // @Param request body schema.ElevenLabsSoundGenerationRequest true "query params"
 // @Success 200 {string} binary	 "Response"
 // @Router /v1/sound-generation [post]
@@ -30,14 +32,33 @@ func SoundGenerationEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader
 			return echo.ErrBadRequest
 		}
 
-		log.Debug().Str("modelFile", "modelFile").Str("backend", cfg.Backend).Msg("Sound Generation Request about to be sent to backend")
+		xlog.Debug("Sound Generation Request about to be sent to backend", "modelFile", "modelFile", "backend", cfg.Backend)
 
-		// TODO: Support uploading files?
-		filePath, _, err := backend.SoundGeneration(input.Text, input.Duration, input.Temperature, input.DoSample, nil, nil, ml, appConfig, *cfg)
+		language := input.Language
+		if language == "" {
+			language = input.VocalLanguage
+		}
+		var bpm *int32
+		if input.BPM != nil {
+			b := int32(*input.BPM)
+			bpm = &b
+		}
+		filePath, _, err := backend.SoundGeneration(
+			c.Request().Context(),
+			input.Text, input.Duration, input.Temperature, input.DoSample,
+			nil, nil,
+			input.Think, input.Caption, input.Lyrics, bpm, input.Keyscale,
+			language, input.Timesignature,
+			input.Instrumental,
+			ml, appConfig, *cfg)
 		if err != nil {
 			return err
 		}
-		return c.Attachment(filePath, filepath.Base(filePath))
 
+		filePath, contentType := audio.NormalizeAudioFile(filePath)
+		if contentType != "" {
+			c.Response().Header().Set("Content-Type", contentType)
+		}
+		return c.Attachment(filePath, filepath.Base(filePath))
 	}
 }

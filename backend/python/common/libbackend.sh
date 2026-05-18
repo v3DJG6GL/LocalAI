@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 
+#
 # use the library by adding the following line to a script:
 # source $(dirname $0)/../common/libbackend.sh
 #
@@ -206,8 +206,8 @@ function init() {
 
 # getBuildProfile will inspect the system to determine which build profile is appropriate:
 # returns one of the following:
-# - cublas11
 # - cublas12
+# - cublas13
 # - hipblas
 # - intel
 function getBuildProfile() {
@@ -318,6 +318,21 @@ _makeVenvPortable() {
 }
 
 
+# Apply the venv to the current process: VIRTUAL_ENV, PATH, PYTHONHOME hygiene.
+# Equivalent to the runtime portion of `source bin/activate`, but computed from
+# $EDIR (resolved at runtime via realpath) instead of the path baked into
+# bin/activate at venv-create time. `uv venv` (and `python -m venv`) both bake
+# the create-time absolute path in, so sourcing activate on a relocated venv —
+# e.g. one built at /vllm/venv inside a Docker stage and unpacked under
+# /backends/cuda13-vllm-development/venv at runtime — silently prepends a
+# stale, non-existent path to $PATH. Doing the setup ourselves sidesteps that;
+# this is the same approach `uv run` takes internally.
+_activateVenv() {
+    export VIRTUAL_ENV="${EDIR}/venv"
+    export PATH="${EDIR}/venv/bin:${PATH}"
+    unset PYTHONHOME
+}
+
 # ensureVenv makes sure that the venv for the backend both exists, and is activated.
 #
 # This function is idempotent, so you can call it as many times as you want and it will
@@ -344,8 +359,17 @@ function ensureVenv() {
 
     if [ ! -d "${EDIR}/venv" ]; then
         if [ "x${USE_PIP}" == "xtrue" ]; then
-            "${interpreter}" -m venv --copies "${EDIR}/venv"
-            source "${EDIR}/venv/bin/activate"
+            # --copies is only needed when we will later relocate the venv via
+            # _makeVenvPortable (PORTABLE_PYTHON=true). Some Python builds —
+            # notably macOS system Python — refuse to create a venv with
+            # --copies because the build doesn't support it. Fall back to
+            # symlinks in that case.
+            local venv_args=""
+            if [ "x${PORTABLE_PYTHON}" == "xtrue" ]; then
+                venv_args="--copies"
+            fi
+            "${interpreter}" -m venv ${venv_args} "${EDIR}/venv"
+            _activateVenv
             "${interpreter}" -m pip install --upgrade pip
         else
             if [ "x${PORTABLE_PYTHON}" == "xtrue" ]; then
@@ -366,7 +390,7 @@ function ensureVenv() {
     fi
 
     if [ "x${VIRTUAL_ENV:-}" != "x${EDIR}/venv" ]; then
-        source "${EDIR}/venv/bin/activate"
+        _activateVenv
     fi
 }
 
@@ -392,13 +416,13 @@ function runProtogen() {
 #  - requirements-${BUILD_TYPE}.txt
 #  - requirements-${BUILD_PROFILE}.txt
 #
-# BUILD_PROFILE is a more specific version of BUILD_TYPE, ex: cuda-11 or cuda-12
+# BUILD_PROFILE is a more specific version of BUILD_TYPE, ex: cuda-12 or cuda-13
 # it can also include some options that we do not have BUILD_TYPES for, ex: intel
 #
 # NOTE: for BUILD_PROFILE==intel, this function does NOT automatically use the Intel python package index.
 # you may want to add the following line to a requirements-intel.txt if you use one:
 #
-# --index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+# --index-url https://download.pytorch.org/whl/xpu
 #
 # If you need to add extra flags into the pip install command you can do so by setting the variable EXTRA_PIP_INSTALL_FLAGS
 # before calling installRequirements.  For example:
@@ -465,6 +489,14 @@ function startBackend() {
     if [ "x${PORTABLE_PYTHON}" == "xtrue" ] || [ -x "$(_portable_python)" ]; then
         _makeVenvPortable --update-pyvenv-cfg
     fi
+
+    # Set up GPU library paths if a lib directory exists
+    # This allows backends to include their own GPU libraries (CUDA, ROCm, etc.)
+    if [ -d "${EDIR}/lib" ]; then
+        export LD_LIBRARY_PATH="${EDIR}/lib:${LD_LIBRARY_PATH:-}"
+        echo "Added ${EDIR}/lib to LD_LIBRARY_PATH for GPU libraries"
+    fi
+
     if [ ! -z "${BACKEND_FILE:-}" ]; then
         exec "${EDIR}/venv/bin/python" "${BACKEND_FILE}" "$@"
     elif [ -e "${MY_DIR}/server.py" ]; then

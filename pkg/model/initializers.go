@@ -9,27 +9,29 @@ import (
 	"time"
 
 	grpc "github.com/mudler/LocalAI/pkg/grpc"
+	"github.com/mudler/xlog"
 	"github.com/phayes/freeport"
-	"github.com/rs/zerolog/log"
 )
 
 const (
-	LLamaCPP = "llama-cpp"
+	LLamaCPP   = "llama-cpp"
+	IKLLamaCPP = "ik-llama-cpp"
 )
 
-var Aliases map[string]string = map[string]string{
+var Aliases = map[string]string{
 	"go-llama":               LLamaCPP,
 	"llama":                  LLamaCPP,
+	"ik_llama":               IKLLamaCPP,
+	"ik-llama":               IKLLamaCPP,
 	"embedded-store":         LocalStoreBackend,
 	"huggingface-embeddings": TransformersBackend,
-	"langchain-huggingface":  LCHuggingFaceBackend,
 	"transformers-musicgen":  TransformersBackend,
 	"sentencetransformers":   TransformersBackend,
 	"mamba":                  TransformersBackend,
 	"stablediffusion":        StableDiffusionGGMLBackend,
 }
 
-var TypeAlias map[string]string = map[string]string{
+var TypeAlias = map[string]string{
 	"sentencetransformers":   "SentenceTransformer",
 	"huggingface-embeddings": "SentenceTransformer",
 	"mamba":                  "Mamba",
@@ -39,7 +41,6 @@ var TypeAlias map[string]string = map[string]string{
 const (
 	WhisperBackend             = "whisper"
 	StableDiffusionGGMLBackend = "stablediffusion-ggml"
-	LCHuggingFaceBackend       = "huggingface"
 
 	TransformersBackend = "transformers"
 	LocalStoreBackend   = "local-store"
@@ -50,7 +51,16 @@ const (
 func (ml *ModelLoader) grpcModel(backend string, o *Options) func(string, string, string) (*Model, error) {
 	return func(modelID, modelName, modelFile string) (*Model, error) {
 
-		log.Debug().Msgf("Loading Model %s with gRPC (file: %s) (backend: %s): %+v", modelID, modelFile, backend, *o)
+		xlog.Debug("Loading Model with gRPC", "modelID", modelID, "file", modelFile, "backend", backend, "options", *o)
+
+		// Distributed mode: delegate to the model router if set
+		ml.mu.Lock()
+		router := ml.modelRouter
+		ml.mu.Unlock()
+		if router != nil {
+			xlog.Info("Routing model to remote node via ModelRouter", "modelID", modelID, "backend", backend)
+			return router(o.context, backend, modelID, modelName, modelFile, o.gRPCOptions, o.parallelRequests)
+		}
 
 		var client *Model
 
@@ -67,17 +77,17 @@ func (ml *ModelLoader) grpcModel(backend string, o *Options) func(string, string
 			if os.Getenv(env) == "" {
 				err := os.Setenv(env, ml.ModelPath)
 				if err != nil {
-					log.Error().Err(err).Str("name", env).Str("modelPath", ml.ModelPath).Msg("unable to set environment variable to modelPath")
+					xlog.Error("unable to set environment variable to modelPath", "error", err, "name", env, "modelPath", ml.ModelPath)
 				}
 			}
 		}
 
 		// Check if the backend is provided as external
 		if uri, ok := ml.GetAllExternalBackends(o)[backend]; ok {
-			log.Debug().Msgf("Loading external backend: %s", uri)
-			// check if uri is a file or a address
+			xlog.Debug("Loading external backend", "uri", uri)
+			// check if uri is a file or an address
 			if fi, err := os.Stat(uri); err == nil {
-				log.Debug().Msgf("external backend is file: %+v", fi)
+				xlog.Debug("external backend is file", "file", fi)
 				serverAddress, err := getFreeAddress()
 				if err != nil {
 					return nil, fmt.Errorf("failed allocating free ports: %s", err.Error())
@@ -85,43 +95,43 @@ func (ml *ModelLoader) grpcModel(backend string, o *Options) func(string, string
 				// Make sure the process is executable
 				process, err := ml.startProcess(uri, modelID, serverAddress)
 				if err != nil {
-					log.Error().Err(err).Str("path", uri).Msg("failed to launch ")
+					xlog.Error("failed to launch", "error", err, "path", uri)
 					return nil, err
 				}
 
-				log.Debug().Msgf("GRPC Service Started")
+				xlog.Debug("GRPC Service Started")
 
 				client = NewModel(modelID, serverAddress, process)
 			} else {
-				log.Debug().Msg("external backend is a uri")
+				xlog.Debug("external backend is a uri")
 				// address
 				client = NewModel(modelID, uri, nil)
 			}
 		} else {
-			log.Error().Msgf("Backend not found: %s", backend)
+			xlog.Error("Backend not found", "backend", backend)
 			return nil, fmt.Errorf("backend not found: %s", backend)
 		}
 
-		log.Debug().Msgf("Wait for the service to start up")
-		log.Debug().Msgf("Options: %+v", o.gRPCOptions)
+		xlog.Debug("Wait for the service to start up")
+		xlog.Debug("Options", "options", o.gRPCOptions)
 
 		// Wait for the service to start up
 		ready := false
-		for i := 0; i < o.grpcAttempts; i++ {
+		for i := range o.grpcAttempts {
 			alive, err := client.GRPC(o.parallelRequests, ml.wd).HealthCheck(context.Background())
 			if alive {
-				log.Debug().Msgf("GRPC Service Ready")
+				xlog.Debug("GRPC Service Ready")
 				ready = true
 				break
 			}
 			if err != nil && i == o.grpcAttempts-1 {
-				log.Error().Err(err).Msg("failed starting/connecting to the gRPC service")
+				xlog.Error("failed starting/connecting to the gRPC service", "error", err)
 			}
 			time.Sleep(time.Duration(o.grpcAttemptsDelay) * time.Second)
 		}
 
 		if !ready {
-			log.Debug().Msgf("GRPC Service NOT ready")
+			xlog.Debug("GRPC Service NOT ready")
 			if process := client.Process(); process != nil {
 				process.Stop()
 			}
@@ -133,7 +143,7 @@ func (ml *ModelLoader) grpcModel(backend string, o *Options) func(string, string
 		options.ModelFile = modelFile
 		options.ModelPath = ml.ModelPath
 
-		log.Debug().Msgf("GRPC: Loading model with options: %+v", options)
+		xlog.Debug("GRPC: Loading model with options", "options", options)
 
 		res, err := client.GRPC(o.parallelRequests, ml.wd).LoadModel(o.context, &options)
 		if err != nil {
@@ -156,16 +166,16 @@ func (ml *ModelLoader) grpcModel(backend string, o *Options) func(string, string
 func (ml *ModelLoader) backendLoader(opts ...Option) (client grpc.Backend, err error) {
 	o := NewOptions(opts...)
 
-	log.Info().Str("modelID", o.modelID).Str("backend", o.backendString).Str("o.model", o.model).Msg("BackendLoader starting")
+	xlog.Info("BackendLoader starting", "modelID", o.modelID, "backend", o.backendString, "model", o.model)
 
 	backend := strings.ToLower(o.backendString)
 	if realBackend, exists := Aliases[backend]; exists {
 		typeAlias, exists := TypeAlias[backend]
 		if exists {
-			log.Debug().Msgf("'%s' is a type alias of '%s' (%s)", backend, realBackend, typeAlias)
+			xlog.Debug("alias is a type alias", "alias", backend, "realBackend", realBackend, "type", typeAlias)
 			o.gRPCOptions.Type = typeAlias
 		} else {
-			log.Debug().Msgf("'%s' is an alias of '%s'", backend, realBackend)
+			xlog.Debug("alias", "alias", backend, "realBackend", realBackend)
 		}
 
 		backend = realBackend
@@ -173,26 +183,86 @@ func (ml *ModelLoader) backendLoader(opts ...Option) (client grpc.Backend, err e
 
 	model, err := ml.LoadModel(o.modelID, o.model, ml.grpcModel(backend, o))
 	if err != nil {
-		if stopErr := ml.StopGRPC(only(o.modelID));stopErr != nil {
-			log.Error().Err(stopErr).Str("model", o.modelID).Msg("error stopping model")
+		// Defensive cleanup: the model usually wasn't registered yet (LoadModel
+		// failed before that), so StopGRPC reporting "model not found" is the
+		// expected case, not an error. The outer Failed-to-load log below
+		// carries the real reason.
+		if stopErr := ml.StopGRPC(only(o.modelID)); stopErr != nil {
+			xlog.Debug("cleanup stop after failed load", "error", stopErr, "model", o.modelID)
 		}
-		log.Error().Str("modelID", o.modelID).Err(err).Msgf("Failed to load model %s with backend %s", o.modelID, o.backendString)
+		xlog.Error("Failed to load model", "modelID", o.modelID, "error", err, "backend", o.backendString)
 		return nil, err
 	}
 
 	return model.GRPC(o.parallelRequests, ml.wd), nil
 }
 
+// retryEnforce repeatedly invokes fn until it returns NeedMore=false or the
+// retry budget is exhausted. It sleeps `retryInterval` between attempts and
+// logs progress under `label`. Used by both LRU and group-exclusivity
+// enforcement so the busy-model wait behaviour is identical.
+func retryEnforce(fn func() EnforceLRULimitResult, maxRetries int, retryInterval time.Duration, label string) {
+	for attempt := range maxRetries {
+		result := fn()
+		if !result.NeedMore {
+			if result.EvictedCount > 0 {
+				xlog.Info("[ModelLoader] "+label+" enforcement complete", "evicted", result.EvictedCount)
+			}
+			return
+		}
+		if attempt < maxRetries-1 {
+			xlog.Info("[ModelLoader] Waiting for busy models to become idle before eviction",
+				"label", label,
+				"evicted", result.EvictedCount,
+				"attempt", attempt+1,
+				"maxRetries", maxRetries,
+				"retryIn", retryInterval)
+			time.Sleep(retryInterval)
+		} else {
+			xlog.Warn("[ModelLoader] "+label+" enforcement incomplete after max retries",
+				"evicted", result.EvictedCount,
+				"reason", "conflicts are still busy or pinned")
+		}
+	}
+}
+
 // enforceLRULimit enforces the LRU limit before loading a new model.
 // This is called before loading a model to ensure we don't exceed the limit.
 // It accounts for models that are currently being loaded by other goroutines.
+// If models are busy and can't be evicted, it will wait and retry until space is available.
 func (ml *ModelLoader) enforceLRULimit() {
 	if ml.wd == nil {
 		return
 	}
-	// Get the count of models currently being loaded to account for concurrent requests
+
 	pendingLoads := ml.GetLoadingCount()
-	ml.wd.EnforceLRULimit(pendingLoads)
+
+	ml.mu.Lock()
+	maxRetries := ml.lruEvictionMaxRetries
+	retryInterval := ml.lruEvictionRetryInterval
+	ml.mu.Unlock()
+
+	retryEnforce(func() EnforceLRULimitResult {
+		return ml.wd.EnforceLRULimit(pendingLoads)
+	}, maxRetries, retryInterval, "LRU")
+}
+
+// enforceGroupExclusivity evicts every loaded model that shares a concurrency
+// group with modelID before loading proceeds. Reuses the LRU retry settings so
+// busy conflicts wait for the same window as a busy LRU eviction.
+func (ml *ModelLoader) enforceGroupExclusivity(modelID string) {
+	if ml.wd == nil {
+		return
+	}
+
+	ml.mu.Lock()
+	maxRetries := ml.lruEvictionMaxRetries
+	retryInterval := ml.lruEvictionRetryInterval
+	ml.mu.Unlock()
+
+	retryEnforce(func() EnforceLRULimitResult {
+		return ml.wd.EnforceGroupExclusivity(modelID)
+	}, maxRetries, retryInterval, "group-exclusivity")
 }
 
 // updateModelLastUsed updates the last used time for a model (for LRU tracking)
@@ -209,11 +279,24 @@ func (ml *ModelLoader) Load(opts ...Option) (grpc.Backend, error) {
 	// Return earlier if we have a model already loaded
 	// (avoid looping through all the backends)
 	if m := ml.CheckIsLoaded(o.modelID); m != nil {
-		log.Debug().Msgf("Model '%s' already loaded", o.modelID)
+		xlog.Debug("Model already loaded", "model", o.modelID)
 		// Update last used time for LRU tracking
 		ml.updateModelLastUsed(m)
-		return m.GRPC(o.parallelRequests, ml.wd), nil
+		client := m.GRPC(o.parallelRequests, ml.wd)
+		// Wrap remote models so connection errors during inference trigger eviction
+		if m.Process() == nil {
+			client = newConnectionEvictingClient(client, o.modelID, func() {
+				ml.ShutdownModel(o.modelID)
+			})
+		}
+		return client, nil
 	}
+
+	// Evict any loaded model that shares a concurrency group with the
+	// requested one before applying the global LRU cap — group eviction may
+	// already make room, and otherwise LRU might evict an unrelated model
+	// only for the group check to immediately evict another.
+	ml.enforceGroupExclusivity(o.modelID)
 
 	// Enforce LRU limit before loading a new model
 	ml.enforceLRULimit()
@@ -223,6 +306,12 @@ func (ml *ModelLoader) Load(opts ...Option) (grpc.Backend, error) {
 		client, err := ml.backendLoader(opts...)
 		if err != nil {
 			return nil, err
+		}
+		// Wrap remote models so connection errors during inference trigger eviction
+		if m := ml.CheckIsLoaded(o.modelID); m != nil && m.Process() == nil {
+			client = newConnectionEvictingClient(client, o.modelID, func() {
+				ml.ShutdownModel(o.modelID)
+			})
 		}
 		return client, nil
 	}
@@ -239,30 +328,36 @@ func (ml *ModelLoader) Load(opts ...Option) (grpc.Backend, error) {
 	}
 
 	if len(autoLoadBackends) == 0 {
-		log.Error().Msg("No backends found")
+		xlog.Error("No backends found")
 		return nil, fmt.Errorf("no backends found")
 	}
 
-	log.Debug().Msgf("Loading from the following backends (in order): %+v", autoLoadBackends)
+	xlog.Debug("Loading from the following backends (in order)", "backends", autoLoadBackends)
 
-	log.Info().Msgf("Trying to load the model '%s' with the backend '%s'", o.modelID, autoLoadBackends)
+	xlog.Info("Trying to load the model", "modelID", o.modelID, "backends", autoLoadBackends)
 
 	for _, key := range autoLoadBackends {
-		log.Info().Msgf("[%s] Attempting to load", key)
+		xlog.Info("Attempting to load", "backend", key)
 		options := append(opts, []Option{
 			WithBackendString(key),
 		}...)
 
 		model, modelerr := ml.backendLoader(options...)
 		if modelerr == nil && model != nil {
-			log.Info().Msgf("[%s] Loads OK", key)
+			xlog.Info("Loads OK", "backend", key)
+			// Wrap remote models so connection errors during inference trigger eviction
+			if m := ml.CheckIsLoaded(o.modelID); m != nil && m.Process() == nil {
+				model = newConnectionEvictingClient(model, o.modelID, func() {
+					ml.ShutdownModel(o.modelID)
+				})
+			}
 			return model, nil
 		} else if modelerr != nil {
 			err = errors.Join(err, fmt.Errorf("[%s]: %w", key, modelerr))
-			log.Info().Msgf("[%s] Fails: %s", key, modelerr.Error())
+			xlog.Info("Fails", "backend", key, "error", modelerr.Error())
 		} else if model == nil {
 			err = errors.Join(err, fmt.Errorf("backend %s returned no usable model", key))
-			log.Info().Msgf("[%s] Fails: %s", key, "backend returned no usable model")
+			xlog.Info("Fails", "backend", key, "error", "backend returned no usable model")
 		}
 	}
 

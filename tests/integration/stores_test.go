@@ -3,13 +3,12 @@ package integration_test
 import (
 	"context"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 
+	"github.com/mudler/xlog"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/grpc"
@@ -39,8 +38,6 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 		BeforeEach(func() {
 			var err error
-
-			zerolog.SetGlobalLevel(zerolog.DebugLevel)
 
 			tmpdir, err = os.MkdirTemp("", "")
 			Expect(err).ToNot(HaveOccurred())
@@ -187,7 +184,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			for i, k := range keys {
 				s := sims[i]
-				log.Debug().Float32("similarity", s).Msgf("key: %v", k)
+				xlog.Debug("key", "similarity", s, "key", k)
 			}
 
 			Expect(keys[0]).To(Equal([]float32{0.5, 0.5, 0.5}))
@@ -214,7 +211,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			for i, k := range ks {
 				s := sims[i]
-				log.Debug().Float32("similarity", s).Msgf("key: %v", k)
+				xlog.Debug("key", "similarity", s, "key", k)
 			}
 
 			Expect(ks[0]).To(Equal(keys[0]))
@@ -314,7 +311,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 		})
 
 		It("It obeys the triangle inequality", func() {
-			rnd := rand.New(rand.NewSource(151))
+			rnd := rand.New(rand.NewPCG(151, 0))
 			keys := make([][]float32, 20)
 			vals := make([][]byte, 20)
 

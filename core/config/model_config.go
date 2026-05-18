@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/pkg/downloader"
 	"github.com/mudler/LocalAI/pkg/functions"
+	"github.com/mudler/LocalAI/pkg/reasoning"
 	"github.com/mudler/cogito"
 	"gopkg.in/yaml.v3"
 )
@@ -30,6 +32,7 @@ type TTSConfig struct {
 // @Description ModelConfig represents a model configuration
 type ModelConfig struct {
 	modelConfigFile          string `yaml:"-" json:"-"`
+	modelTemplate            string `yaml:"-" json:"-"`
 	schema.PredictionOptions `yaml:"parameters,omitempty" json:"parameters,omitempty"`
 	Name                     string `yaml:"name,omitempty" json:"name,omitempty"`
 
@@ -44,13 +47,20 @@ type ModelConfig struct {
 	KnownUsecases       *ModelConfigUsecase `yaml:"-" json:"-"`
 	Pipeline            Pipeline            `yaml:"pipeline,omitempty" json:"pipeline,omitempty"`
 
-	PromptStrings, InputStrings                []string               `yaml:"-" json:"-"`
-	InputToken                                 [][]int                `yaml:"-" json:"-"`
-	functionCallString, functionCallNameString string                 `yaml:"-" json:"-"`
-	ResponseFormat                             string                 `yaml:"-" json:"-"`
-	ResponseFormatMap                          map[string]interface{} `yaml:"-" json:"-"`
+	PromptStrings, InputStrings                []string       `yaml:"-" json:"-"`
+	InputToken                                 [][]int        `yaml:"-" json:"-"`
+	functionCallString, functionCallNameString string         `yaml:"-" json:"-"`
+	ResponseFormat                             string         `yaml:"-" json:"-"`
+	ResponseFormatMap                          map[string]any `yaml:"-" json:"-"`
+
+	// MediaMarker is the runtime-discovered multimodal marker the backend expects
+	// in the prompt (e.g. "<__media__>" or a random "<__media_<rand>__>" picked by
+	// llama.cpp). Populated on first successful ModelMetadata call. Empty until
+	// then — callers must fall back to templates.DefaultMultiMediaMarker.
+	MediaMarker string `yaml:"-" json:"-"`
 
 	FunctionsConfig functions.FunctionsConfig `yaml:"function,omitempty" json:"function,omitempty"`
+	ReasoningConfig reasoning.Config          `yaml:"reasoning,omitempty" json:"reasoning,omitempty"`
 
 	FeatureFlag FeatureFlag `yaml:"feature_flags,omitempty" json:"feature_flags,omitempty"` // Feature Flag registry. We move fast, and features may break on a per model/backend basis. Registry for (usually temporary) flags that indicate aborting something early.
 	// LLM configs (GPT4ALL, Llama.cpp, ...)
@@ -74,6 +84,13 @@ type ModelConfig struct {
 
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 	Usage       string `yaml:"usage,omitempty" json:"usage,omitempty"`
+	Disabled    *bool  `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+	Pinned      *bool  `yaml:"pinned,omitempty" json:"pinned,omitempty"`
+
+	// ConcurrencyGroups declares per-node mutual-exclusion groups: the model
+	// cannot be loaded alongside another model that shares any group name.
+	// See docs/content/advanced/vram-management.md for usage.
+	ConcurrencyGroups []string `yaml:"concurrency_groups,omitempty" json:"concurrency_groups,omitempty"`
 
 	Options   []string `yaml:"options,omitempty" json:"options,omitempty"`
 	Overrides []string `yaml:"overrides,omitempty" json:"overrides,omitempty"`
@@ -96,6 +113,15 @@ type AgentConfig struct {
 	EnablePlanning        bool `yaml:"enable_planning,omitempty" json:"enable_planning,omitempty"`
 	EnableMCPPrompts      bool `yaml:"enable_mcp_prompts,omitempty" json:"enable_mcp_prompts,omitempty"`
 	EnablePlanReEvaluator bool `yaml:"enable_plan_re_evaluator,omitempty" json:"enable_plan_re_evaluator,omitempty"`
+	DisableSinkState      bool `yaml:"disable_sink_state,omitempty" json:"disable_sink_state,omitempty"`
+	LoopDetection         int  `yaml:"loop_detection,omitempty" json:"loop_detection,omitempty"`
+	MaxAdjustmentAttempts int  `yaml:"max_adjustment_attempts,omitempty" json:"max_adjustment_attempts,omitempty"`
+	ForceReasoningTool    bool `yaml:"force_reasoning_tool,omitempty" json:"force_reasoning_tool,omitempty"`
+}
+
+// HasMCPServers returns true if any MCP servers (remote or stdio) are configured.
+func (c MCPConfig) HasMCPServers() bool {
+	return c.Servers != "" || c.Stdio != ""
 }
 
 func (c *MCPConfig) MCPConfigFromYAML() (MCPGenericConfig[MCPRemoteServers], MCPGenericConfig[MCPSTDIOServers], error) {
@@ -221,7 +247,13 @@ type LLMConfig struct {
 	DisableLogStatus     bool             `yaml:"disable_log_stats,omitempty" json:"disable_log_stats,omitempty"`           // vLLM
 	DType                string           `yaml:"dtype,omitempty" json:"dtype,omitempty"`                                   // vLLM
 	LimitMMPerPrompt     LimitMMPerPrompt `yaml:"limit_mm_per_prompt,omitempty" json:"limit_mm_per_prompt,omitempty"`       // vLLM
-	MMProj               string           `yaml:"mmproj,omitempty" json:"mmproj,omitempty"`
+	// EngineArgs is a backend-native passthrough applied to the engine constructor
+	// (e.g. vLLM AsyncEngineArgs). Values may be primitives or nested maps; nested
+	// maps materialise into the backend's nested config dataclasses (e.g.
+	// SpeculativeConfig, KVTransferConfig, CompilationConfig). Unknown keys cause
+	// the backend to fail LoadModel with a list of valid names.
+	EngineArgs map[string]any `yaml:"engine_args,omitempty" json:"engine_args,omitempty"`
+	MMProj     string         `yaml:"mmproj,omitempty" json:"mmproj,omitempty"`
 
 	FlashAttention *string `yaml:"flash_attention,omitempty" json:"flash_attention,omitempty"`
 	NoKVOffloading bool    `yaml:"no_kv_offloading,omitempty" json:"no_kv_offloading,omitempty"`
@@ -368,9 +400,15 @@ func (cfg *ModelConfig) SetDefaults(opts ...ConfigLoaderOption) {
 	threads := lo.threads
 	f16 := lo.f16
 	debug := lo.debug
+
+	// Apply model-family-specific inference defaults before generic fallbacks.
+	// This ensures gallery-installed and runtime-loaded models get optimal parameters.
+	ApplyInferenceDefaults(cfg, cfg.Name, cfg.Model)
+
 	// https://github.com/ggerganov/llama.cpp/blob/75cd4c77292034ecec587ecb401366f57338f7c0/common/sampling.h#L22
 	defaultTopP := 0.95
 	defaultTopK := 40
+	defaultMinP := 0.0
 	defaultTemp := 0.9
 	// https://github.com/mudler/LocalAI/issues/2780
 	defaultMirostat := 0
@@ -391,6 +429,10 @@ func (cfg *ModelConfig) SetDefaults(opts ...ConfigLoaderOption) {
 
 	if cfg.TopK == nil {
 		cfg.TopK = &defaultTopK
+	}
+
+	if cfg.MinP == nil {
+		cfg.MinP = &defaultMinP
 	}
 
 	if cfg.TypicalP == nil {
@@ -473,7 +515,12 @@ func (cfg *ModelConfig) SetDefaults(opts ...ConfigLoaderOption) {
 		cfg.Debug = &trueV
 	}
 
-	guessDefaultsFromFile(cfg, lo.modelPath, ctx)
+	// If a context size was provided via LoadOptions, apply it before hooks so they
+	// don't override it with their own defaults.
+	if ctx != 0 && cfg.ContextSize == nil {
+		cfg.ContextSize = &ctx
+	}
+	runBackendHooks(cfg, lo.modelPath)
 	cfg.syncKnownUsecasesFromString()
 }
 
@@ -501,7 +548,22 @@ func (c *ModelConfig) Validate() (bool, error) {
 		if !re.MatchString(c.Backend) {
 			return false, fmt.Errorf("invalid backend name: %s", c.Backend)
 		}
-		return true, nil
+	}
+
+	// Validate MCP configuration if present
+	if c.MCP.Servers != "" || c.MCP.Stdio != "" {
+		if _, _, err := c.MCP.MCPConfigFromYAML(); err != nil {
+			return false, fmt.Errorf("invalid MCP configuration: %w", err)
+		}
+	}
+
+	// engine_args crosses the gRPC boundary as a JSON-encoded string. Reject
+	// unmarshalable values here so a config that would silently lose user-set
+	// options at load time is rejected at parse time instead.
+	if len(c.EngineArgs) > 0 {
+		if _, err := json.Marshal(c.EngineArgs); err != nil {
+			return false, fmt.Errorf("engine_args is not JSON-serialisable: %w", err)
+		}
 	}
 
 	return true, nil
@@ -513,6 +575,43 @@ func (c *ModelConfig) HasTemplate() bool {
 
 func (c *ModelConfig) GetModelConfigFile() string {
 	return c.modelConfigFile
+}
+
+// GetModelTemplate returns the model's chat template if available
+func (c *ModelConfig) GetModelTemplate() string {
+	return c.modelTemplate
+}
+
+// IsDisabled returns true if the model is disabled
+func (c *ModelConfig) IsDisabled() bool {
+	return c.Disabled != nil && *c.Disabled
+}
+
+// IsPinned returns true if the model is pinned (excluded from idle unloading and eviction)
+func (c *ModelConfig) IsPinned() bool {
+	return c.Pinned != nil && *c.Pinned
+}
+
+// GetConcurrencyGroups returns the model's concurrency groups, normalized:
+// trimmed of whitespace, empty entries dropped, deduped. Returns nil when no
+// effective groups remain. The result is a fresh slice; the caller may
+// mutate it without affecting the config.
+func (c *ModelConfig) GetConcurrencyGroups() []string {
+	if len(c.ConcurrencyGroups) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.ConcurrencyGroups))
+	for _, g := range c.ConcurrencyGroups {
+		g = strings.TrimSpace(g)
+		if g == "" || slices.Contains(out, g) {
+			continue
+		}
+		out = append(out, g)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 type ModelConfigUsecase int
@@ -531,11 +630,45 @@ const (
 	FLAG_TOKENIZE         ModelConfigUsecase = 0b001000000000
 	FLAG_VAD              ModelConfigUsecase = 0b010000000000
 	FLAG_VIDEO            ModelConfigUsecase = 0b100000000000
-	FLAG_DETECTION        ModelConfigUsecase = 0b1000000000000
+	FLAG_DETECTION           ModelConfigUsecase = 0b1000000000000
+	FLAG_VISION              ModelConfigUsecase = 0b10000000000000
+	FLAG_FACE_RECOGNITION    ModelConfigUsecase = 0b100000000000000
+	FLAG_SPEAKER_RECOGNITION ModelConfigUsecase = 0b1000000000000000
+	FLAG_AUDIO_TRANSFORM     ModelConfigUsecase = 0b10000000000000000
+	FLAG_DIARIZATION         ModelConfigUsecase = 0b100000000000000000
+	FLAG_REALTIME_AUDIO      ModelConfigUsecase = 0b1000000000000000000
 
 	// Common Subsets
 	FLAG_LLM ModelConfigUsecase = FLAG_CHAT | FLAG_COMPLETION | FLAG_EDIT
 )
+
+// ModalityGroups defines groups of usecases that belong to the same modality.
+// Flags within the same group are NOT orthogonal (e.g., chat and completion are
+// both text/language). A model is multimodal when its usecases span 2+ groups.
+var ModalityGroups = []ModelConfigUsecase{
+	FLAG_CHAT | FLAG_COMPLETION | FLAG_EDIT,    // text/language
+	FLAG_VISION | FLAG_DETECTION,               // visual understanding
+	FLAG_TRANSCRIPT | FLAG_REALTIME_AUDIO,      // speech input — realtime_audio is any-to-any, so it counts here too
+	FLAG_TTS | FLAG_SOUND_GENERATION | FLAG_REALTIME_AUDIO, // audio output — and here, so a lone realtime_audio flag still reads as multimodal
+	FLAG_AUDIO_TRANSFORM,                       // audio in/out transforms
+	FLAG_IMAGE | FLAG_VIDEO,                    // visual generation
+}
+
+// IsMultimodal returns true if the given usecases span two or more orthogonal
+// modality groups. For example chat+vision is multimodal, but chat+completion
+// is not (both belong to the text/language group).
+func IsMultimodal(usecases ModelConfigUsecase) bool {
+	groupCount := 0
+	for _, group := range ModalityGroups {
+		if usecases&group != 0 {
+			groupCount++
+			if groupCount >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func GetAllModelConfigUsecases() map[string]ModelConfigUsecase {
 	return map[string]ModelConfigUsecase{
@@ -554,7 +687,13 @@ func GetAllModelConfigUsecases() map[string]ModelConfigUsecase {
 		"FLAG_VAD":              FLAG_VAD,
 		"FLAG_LLM":              FLAG_LLM,
 		"FLAG_VIDEO":            FLAG_VIDEO,
-		"FLAG_DETECTION":        FLAG_DETECTION,
+		"FLAG_DETECTION":           FLAG_DETECTION,
+		"FLAG_VISION":              FLAG_VISION,
+		"FLAG_FACE_RECOGNITION":    FLAG_FACE_RECOGNITION,
+		"FLAG_SPEAKER_RECOGNITION": FLAG_SPEAKER_RECOGNITION,
+		"FLAG_AUDIO_TRANSFORM":     FLAG_AUDIO_TRANSFORM,
+		"FLAG_DIARIZATION":         FLAG_DIARIZATION,
+		"FLAG_REALTIME_AUDIO":      FLAG_REALTIME_AUDIO,
 	}
 }
 
@@ -591,13 +730,30 @@ func (c *ModelConfig) HasUsecases(u ModelConfigUsecase) bool {
 // In its current state, this function should ideally check for properties of the config like templates, rather than the direct backend name checks for the lower half.
 // This avoids the maintenance burden of updating this list for each new backend - but unfortunately, that's the best option for some services currently.
 func (c *ModelConfig) GuessUsecases(u ModelConfigUsecase) bool {
+	// Backends that are clearly not text-generation
+	nonTextGenBackends := []string{
+		"whisper", "piper", "kokoro",
+		"diffusers", "stablediffusion", "stablediffusion-ggml",
+		"rerankers", "silero-vad", "rfdetr", "insightface", "speaker-recognition",
+		"transformers-musicgen", "ace-step", "acestep-cpp",
+	}
+
 	if (u & FLAG_CHAT) == FLAG_CHAT {
 		if c.TemplateConfig.Chat == "" && c.TemplateConfig.ChatMessage == "" && !c.TemplateConfig.UseTokenizerTemplate {
+			return false
+		}
+		if slices.Contains(nonTextGenBackends, c.Backend) {
+			return false
+		}
+		if c.Embeddings != nil && *c.Embeddings {
 			return false
 		}
 	}
 	if (u & FLAG_COMPLETION) == FLAG_COMPLETION {
 		if c.TemplateConfig.Completion == "" {
+			return false
+		}
+		if slices.Contains(nonTextGenBackends, c.Backend) {
 			return false
 		}
 	}
@@ -623,7 +779,7 @@ func (c *ModelConfig) GuessUsecases(u ModelConfigUsecase) bool {
 
 	}
 	if (u & FLAG_VIDEO) == FLAG_VIDEO {
-		videoBackends := []string{"diffusers", "stablediffusion"}
+		videoBackends := []string{"diffusers", "stablediffusion", "vllm-omni"}
 		if !slices.Contains(videoBackends, c.Backend) {
 			return false
 		}
@@ -634,7 +790,7 @@ func (c *ModelConfig) GuessUsecases(u ModelConfigUsecase) bool {
 
 	}
 	if (u & FLAG_RERANK) == FLAG_RERANK {
-		if c.Backend != "rerankers" {
+		if c.Backend != "rerankers" && (c.Reranking == nil || !*c.Reranking) {
 			return false
 		}
 	}
@@ -642,22 +798,49 @@ func (c *ModelConfig) GuessUsecases(u ModelConfigUsecase) bool {
 		if c.Backend != "whisper" {
 			return false
 		}
+		// whisper models with vad_only option are VAD, not transcription
+		if slices.Contains(c.Options, "vad_only") {
+			return false
+		}
 	}
 	if (u & FLAG_TTS) == FLAG_TTS {
-		ttsBackends := []string{"bark-cpp", "piper", "transformers-musicgen", "kokoro"}
+		ttsBackends := []string{"piper", "transformers-musicgen", "kokoro"}
 		if !slices.Contains(ttsBackends, c.Backend) {
 			return false
 		}
 	}
 
 	if (u & FLAG_DETECTION) == FLAG_DETECTION {
-		if c.Backend != "rfdetr" {
+		detectionBackends := []string{"rfdetr", "sam3-cpp", "insightface"}
+		if !slices.Contains(detectionBackends, c.Backend) {
+			return false
+		}
+	}
+
+	if (u & FLAG_FACE_RECOGNITION) == FLAG_FACE_RECOGNITION {
+		faceBackends := []string{"insightface"}
+		if !slices.Contains(faceBackends, c.Backend) {
+			return false
+		}
+	}
+
+	if (u & FLAG_SPEAKER_RECOGNITION) == FLAG_SPEAKER_RECOGNITION {
+		speakerBackends := []string{"speaker-recognition"}
+		if !slices.Contains(speakerBackends, c.Backend) {
+			return false
+		}
+	}
+
+	if (u & FLAG_AUDIO_TRANSFORM) == FLAG_AUDIO_TRANSFORM {
+		audioTransformBackends := []string{"localvqe"}
+		if !slices.Contains(audioTransformBackends, c.Backend) {
 			return false
 		}
 	}
 
 	if (u & FLAG_SOUND_GENERATION) == FLAG_SOUND_GENERATION {
-		if c.Backend != "transformers-musicgen" {
+		soundGenBackends := []string{"transformers-musicgen", "ace-step", "acestep-cpp", "mock-backend"}
+		if !slices.Contains(soundGenBackends, c.Backend) {
 			return false
 		}
 	}
@@ -670,7 +853,27 @@ func (c *ModelConfig) GuessUsecases(u ModelConfigUsecase) bool {
 	}
 
 	if (u & FLAG_VAD) == FLAG_VAD {
-		if c.Backend != "silero-vad" {
+		if c.Backend != "silero-vad" && c.Backend != "sherpa-onnx" && !(c.Backend == "whisper" && slices.Contains(c.Options, "vad_only")) {
+			return false
+		}
+	}
+
+	if (u & FLAG_DIARIZATION) == FLAG_DIARIZATION {
+		// vibevoice-cpp emits speaker-labelled segments natively from its
+		// ASR pass; sherpa-onnx pipes pyannote segmentation + speaker
+		// embeddings + clustering. Both surface as a Diarize gRPC.
+		diarizationBackends := []string{"vibevoice-cpp", "sherpa-onnx"}
+		if !slices.Contains(diarizationBackends, c.Backend) {
+			return false
+		}
+	}
+
+	if (u & FLAG_REALTIME_AUDIO) == FLAG_REALTIME_AUDIO {
+		// Backends that own a single any-to-any loop and implement
+		// AudioToAudioStream — listed here so models without an explicit
+		// known_usecases still surface on the Talk page.
+		realtimeAudioBackends := []string{"liquid-audio"}
+		if !slices.Contains(realtimeAudioBackends, c.Backend) {
 			return false
 		}
 	}
@@ -689,7 +892,7 @@ func (c *ModelConfig) BuildCogitoOptions() []cogito.Option {
 
 	// Apply agent configuration options
 	if c.Agent.EnableReasoning {
-		cogitoOpts = append(cogitoOpts, cogito.EnableToolReasoner)
+		cogitoOpts = append(cogitoOpts, cogito.WithForceReasoning())
 	}
 
 	if c.Agent.EnablePlanning {
@@ -710,6 +913,22 @@ func (c *ModelConfig) BuildCogitoOptions() []cogito.Option {
 
 	if c.Agent.MaxAttempts != 0 {
 		cogitoOpts = append(cogitoOpts, cogito.WithMaxAttempts(c.Agent.MaxAttempts))
+	}
+
+	if c.Agent.DisableSinkState {
+		cogitoOpts = append(cogitoOpts, cogito.DisableSinkState)
+	}
+
+	if c.Agent.LoopDetection != 0 {
+		cogitoOpts = append(cogitoOpts, cogito.WithLoopDetection(c.Agent.LoopDetection))
+	}
+
+	if c.Agent.MaxAdjustmentAttempts != 0 {
+		cogitoOpts = append(cogitoOpts, cogito.WithMaxAdjustmentAttempts(c.Agent.MaxAdjustmentAttempts))
+	}
+
+	if c.Agent.ForceReasoningTool {
+		cogitoOpts = append(cogitoOpts, cogito.WithForceReasoningTool())
 	}
 
 	return cogitoOpts

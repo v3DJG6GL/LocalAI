@@ -20,7 +20,7 @@ import (
 	"github.com/mudler/LocalAI/pkg/oci"
 	"github.com/mudler/LocalAI/pkg/utils"
 	"github.com/mudler/LocalAI/pkg/xio"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 const (
@@ -39,10 +39,89 @@ const (
 
 type URI string
 
+// ImageVerifier verifies the integrity of an OCI image — typically a
+// cosign signature check against a sigstore policy. The downloader runs
+// VerifyImage between fetching the image manifest and extracting its
+// layers, so verification failure prevents any tampered bytes reaching
+// disk.
+//
+// pkg/oci/cosignverify.Verifier satisfies this interface.
+type ImageVerifier interface {
+	VerifyImage(ctx context.Context, imageRef string) error
+}
+
+type downloadOptions struct {
+	verifier ImageVerifier
+}
+
+// DownloadOption configures DownloadFileWithContext / DownloadFile.
+//
+// Variadic at the end of the signature keeps the public API backward
+// compatible: existing callers that don't care about verification keep
+// compiling untouched.
+type DownloadOption func(*downloadOptions)
+
+// WithImageVerifier attaches an ImageVerifier that runs against OCI
+// downloads only. No-op for tarball / HTTP / Ollama / local downloads —
+// those paths use SHA256 integrity instead.
+func WithImageVerifier(v ImageVerifier) DownloadOption {
+	return func(o *downloadOptions) { o.verifier = v }
+}
+
+func applyDownloadOptions(opts []DownloadOption) downloadOptions {
+	var o downloadOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// pinnedImageRef rewrites `repo:tag` (or `repo[@digest]`) into `repo@<digest>`
+// so callers can pass the explicit digest the downloader just resolved to
+// any tag-following client, eliminating TOCTOU between fetches.
+func pinnedImageRef(ref, digest string) string {
+	// Strip an existing @digest if present so we always emit a clean ref.
+	if at := strings.LastIndex(ref, "@"); at != -1 {
+		// Only treat as a digest separator when not preceded by a slash
+		// (avoids breaking unusual hostnames). Conservative: just keep
+		// the registry+repo portion.
+		ref = ref[:at]
+	}
+	// Strip an existing :tag — find the rightmost colon after the last
+	// slash so we don't touch the registry port (e.g. localhost:5000/foo:latest).
+	slash := strings.LastIndex(ref, "/")
+	if colon := strings.LastIndex(ref, ":"); colon > slash {
+		ref = ref[:colon]
+	}
+	return ref + "@" + digest
+}
+
 // HF_ENDPOINT is the HuggingFace endpoint, can be overridden by setting the HF_ENDPOINT environment variable.
 var HF_ENDPOINT string = loadConfig()
 
+// loadConfig returns the HuggingFace endpoint URL.
+// It supports the following environment variables in order of precedence:
+// 1. HF_MIRROR - if set, uses this as the mirror URL (takes precedence over HF_ENDPOINT)
+// 2. HF_ENDPOINT - if set, uses this as the endpoint
+// 3. Default: https://huggingface.co
+//
+// HF_MIRROR supports both full URLs (https://hf-mirror.com) and simple hostnames (hf-mirror.com).
+// If no scheme is provided, https:// is automatically added.
 func loadConfig() string {
+	// Check for HF_MIRROR first (takes precedence)
+	HF_MIRROR := os.Getenv("HF_MIRROR")
+	if HF_MIRROR == "" {
+		HF_MIRROR = os.Getenv("HF")
+	}
+	if HF_MIRROR != "" {
+		// Normalize the mirror URL - add https:// if no scheme
+		if !strings.HasPrefix(HF_MIRROR, "http://") && !strings.HasPrefix(HF_MIRROR, "https://") {
+			HF_MIRROR = "https://" + HF_MIRROR
+		}
+		return HF_MIRROR
+	}
+
+	// Fall back to HF_ENDPOINT
 	HF_ENDPOINT := os.Getenv("HF_ENDPOINT")
 	if HF_ENDPOINT == "" {
 		HF_ENDPOINT = "https://huggingface.co"
@@ -70,7 +149,7 @@ func (uri URI) ReadWithAuthorizationAndCallback(ctx context.Context, basePath st
 		// Check if the local file is rooted in basePath
 		err = utils.InTrustedRoot(resolvedFile, resolvedBasePath)
 		if err != nil {
-			log.Debug().Str("resolvedFile", resolvedFile).Str("basePath", basePath).Msg("downloader.GetURI blocked an attempt to ready a file url outside of basePath")
+			xlog.Debug("downloader.GetURI blocked an attempt to ready a file url outside of basePath", "resolvedFile", resolvedFile, "basePath", basePath)
 			return err
 		}
 		// Read the response body
@@ -225,7 +304,7 @@ func (s URI) ResolveURL() string {
 		repo := repoPieces[1]
 
 		branch := "main"
-		filepath := repoPieces[2]
+		filepath := strings.Join(repoPieces[2:], "/")
 
 		if len(repoID) > 1 {
 			if strings.Contains(repo, "@") {
@@ -239,19 +318,22 @@ func (s URI) ResolveURL() string {
 		return fmt.Sprintf("%s/%s/%s/resolve/%s/%s", HF_ENDPOINT, owner, repo, branch, filepath)
 	}
 
+	// If a HuggingFace mirror is configured, rewrite direct https://huggingface.co/ URLs
+	// to use the mirror. This ensures gallery entries with hardcoded URLs also benefit
+	// from the mirror setting.
+	if HF_ENDPOINT != "https://huggingface.co" && strings.HasPrefix(string(s), "https://huggingface.co/") {
+		return HF_ENDPOINT + strings.TrimPrefix(string(s), "https://huggingface.co")
+	}
+
 	return string(s)
 }
 
 func removePartialFile(tmpFilePath string) error {
-	_, err := os.Stat(tmpFilePath)
-	if err == nil {
-		log.Debug().Msgf("Removing temporary file %s", tmpFilePath)
-		err = os.Remove(tmpFilePath)
-		if err != nil {
-			err1 := fmt.Errorf("failed to remove temporary download file %s: %v", tmpFilePath, err)
-			log.Warn().Msg(err1.Error())
-			return err1
-		}
+	xlog.Debug("Removing temporary file", "file", tmpFilePath)
+	if err := os.Remove(tmpFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		err1 := fmt.Errorf("failed to remove temporary download file %s: %v", tmpFilePath, err)
+		xlog.Warn("failed to remove temporary download file", "error", err1)
+		return err1
 	}
 	return nil
 }
@@ -275,18 +357,92 @@ func (uri URI) checkSeverSupportsRangeHeader() (bool, error) {
 	return resp.Header.Get("Accept-Ranges") == "bytes", nil
 }
 
-func (uri URI) DownloadFile(filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64)) error {
-	return uri.DownloadFileWithContext(context.Background(), filePath, sha, fileN, total, downloadStatus)
+// ContentLength returns the size in bytes of the resource at the URI.
+// For file:// it uses os.Stat on the resolved path; for HTTP/HTTPS it uses HEAD
+// and optionally a Range request if Content-Length is missing.
+func (u URI) ContentLength(ctx context.Context) (int64, error) {
+	urlStr := u.ResolveURL()
+	if strings.HasPrefix(string(u), LocalPrefix) {
+		info, err := os.Stat(urlStr)
+		if err != nil {
+			return 0, err
+		}
+		return info.Size(), nil
+	}
+	if !strings.HasPrefix(urlStr, HTTPPrefix) && !strings.HasPrefix(urlStr, HTTPSPrefix) {
+		return 0, fmt.Errorf("unsupported URI scheme for ContentLength: %s", string(u))
+	}
+	req, err := http.NewRequestWithContext(ctx, "HEAD", urlStr, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("HEAD %s: status %d", urlStr, resp.StatusCode)
+	}
+	if resp.ContentLength >= 0 {
+		return resp.ContentLength, nil
+	}
+	if resp.Header.Get("Accept-Ranges") != "bytes" {
+		return 0, fmt.Errorf("HEAD %s: no Content-Length and server does not support Range", urlStr)
+	}
+	req2, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return 0, err
+	}
+	req2.Header.Set("Range", "bytes=0-0")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		return 0, err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusPartialContent && resp2.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("Range request %s: status %d", urlStr, resp2.StatusCode)
+	}
+	cr := resp2.Header.Get("Content-Range")
+	// Content-Range: bytes 0-0/12345
+	if cr == "" {
+		return 0, fmt.Errorf("Range request %s: no Content-Range header", urlStr)
+	}
+	parts := strings.Split(cr, "/")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid Content-Range: %s", cr)
+	}
+	size, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if err != nil || size < 0 {
+		return 0, fmt.Errorf("invalid Content-Range total length: %s", parts[1])
+	}
+	return size, nil
 }
 
-func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64)) error {
+func (uri URI) DownloadFile(filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64), opts ...DownloadOption) error {
+	return uri.DownloadFileWithContext(context.Background(), filePath, sha, fileN, total, downloadStatus, opts...)
+}
+
+func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string, fileN, total int, downloadStatus func(string, string, string, float64), opts ...DownloadOption) error {
+	dopts := applyDownloadOptions(opts)
 	url := uri.ResolveURL()
 	if uri.LooksLikeOCI() {
 
 		// Only Ollama wants to download to the file, for the rest, we want to download to the directory
-		// so we check if filepath has any extension, otherwise we assume it's a directory
-		if filepath.Ext(filePath) != "" && !strings.HasPrefix(url, OllamaPrefix) {
-			filePath = filepath.Dir(filePath)
+		// so we check if filepath has any extension, otherwise we assume it's a directory.
+		// Caveat: `filepath.Ext` treats any dot-suffix as an extension, so paths like
+		// `backends/local-store.upgrade-tmp` (the tmp dir created by gallery.UpgradeBackend)
+		// look like a "file" to this heuristic and get rewritten to their parent — which
+		// then unpacks the image at `backends/` top level and clobbers the real install
+		// with a flat-layout file. Guard against that by short-circuiting when the caller
+		// has already created the target as a directory: OCI destinations are always dirs
+		// in that case, regardless of what their suffix looks like.
+		if !strings.HasPrefix(url, OllamaPrefix) {
+			if fi, statErr := os.Stat(filePath); statErr == nil && fi.IsDir() {
+				// Existing directory — use as-is.
+			} else if filepath.Ext(filePath) != "" {
+				filePath = filepath.Dir(filePath)
+			}
 		}
 
 		progressStatus := func(desc ocispec.Descriptor) io.Writer {
@@ -320,6 +476,23 @@ func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string
 			return fmt.Errorf("failed to get image %q: %v", url, err)
 		}
 
+		// Verify before extract so tampered bytes never reach disk. We
+		// re-pin the ref to the manifest digest we just fetched: the
+		// verifier would otherwise resolve the tag again, opening a tiny
+		// TOCTOU window in which a registry could swap the underlying
+		// manifest between the two HEADs.
+		if dopts.verifier != nil {
+			digest, derr := img.Digest()
+			if derr != nil {
+				return fmt.Errorf("resolving digest for verification of %q: %v", url, derr)
+			}
+			pinned := pinnedImageRef(url, digest.String())
+			if verr := dopts.verifier.VerifyImage(ctx, pinned); verr != nil {
+				return fmt.Errorf("image verification failed for %q: %w", url, verr)
+			}
+			xlog.Info("Image signature verified", "ref", pinned)
+		}
+
 		return oci.ExtractOCIImage(ctx, img, url, filePath, downloadStatus)
 	}
 
@@ -331,39 +504,44 @@ func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string
 	}
 
 	// Check if the file already exists
-	_, err := os.Stat(filePath)
+	fi, err := os.Stat(filePath)
 	if err == nil {
-		log.Debug().Str("filePath", filePath).Msg("[downloader] File already exists")
-		// File exists, check SHA
-		if sha != "" {
-			// Verify SHA
-			calculatedSHA, err := calculateSHA(filePath)
-			if err != nil {
-				return fmt.Errorf("failed to calculate SHA for file %q: %v", filePath, err)
-			}
-			if calculatedSHA == sha {
-				// SHA matches, skip downloading
-				log.Debug().Msgf("File %q already exists and matches the SHA. Skipping download", filePath)
+		// Directories don't count as cached downloads (e.g. empty dirs left
+		// by failed OCI extractions). Only skip for regular files.
+		if fi.IsDir() {
+			xlog.Debug("[downloader] Path is a directory, not treating as cached download", "filePath", filePath)
+		} else {
+			xlog.Debug("[downloader] File already exists", "filePath", filePath)
+			// File exists, check SHA
+			if sha != "" {
+				// Verify SHA
+				calculatedSHA, err := CalculateSHA(filePath)
+				if err != nil {
+					return fmt.Errorf("failed to calculate SHA for file %q: %v", filePath, err)
+				}
+				if calculatedSHA == sha {
+					// SHA matches, skip downloading
+					xlog.Debug("File already exists and matches the SHA. Skipping download", "file", filePath)
+					return nil
+				}
+				// SHA doesn't match, delete the file and download again
+				err = os.Remove(filePath)
+				if err != nil {
+					return fmt.Errorf("failed to remove existing file %q: %v", filePath, err)
+				}
+				xlog.Debug("Removed file (SHA doesn't match)", "file", filePath)
+			} else {
+				// SHA is missing, skip downloading
+				xlog.Debug("File already exists. Skipping download", "file", filePath)
 				return nil
 			}
-			// SHA doesn't match, delete the file and download again
-			err = os.Remove(filePath)
-			if err != nil {
-				return fmt.Errorf("failed to remove existing file %q: %v", filePath, err)
-			}
-			log.Debug().Msgf("Removed %q (SHA doesn't match)", filePath)
-
-		} else {
-			// SHA is missing, skip downloading
-			log.Debug().Msgf("File %q already exists. Skipping download", filePath)
-			return nil
 		}
 	} else if !os.IsNotExist(err) || !URI(url).LooksLikeHTTPURL() {
 		// Error occurred while checking file existence
-		return fmt.Errorf("file %s does not exist (%v) and %s does not look like an HTTP URL", filePath, err, url)
+		return fmt.Errorf("could not fetch %q: local file does not exist (%v) and %q is not a recognized downloadable URL (supported schemes: %s)", filePath, err, url, strings.Join([]string{HTTPPrefix, HTTPSPrefix, LocalPrefix, HuggingFacePrefix, HuggingFacePrefix1, OllamaPrefix, OCIPrefix, OCIFilePrefix, GithubURI2}, ", "))
 	}
 
-	log.Info().Msgf("Downloading %s", url)
+	xlog.Info("Downloading", "url", url)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -471,28 +649,36 @@ func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string
 	default:
 	}
 
+	// Invariant: verify the streamed hash before promoting the temp file to
+	// the final path. Renaming first would leave tampered content reachable
+	// to subsequent readers even though we return an error.
+	if sha != "" {
+		calculatedSHA := fmt.Sprintf("%x", progress.hash.Sum(nil))
+		if calculatedSHA != sha {
+			xlog.Debug("SHA mismatch for file", "file", filePath, "calculated", calculatedSHA, "metadata", sha)
+			_ = removePartialFile(tmpFilePath)
+			return fmt.Errorf("SHA mismatch for file %q ( calculated: %s != metadata: %s )", filePath, calculatedSHA, sha)
+		}
+	} else {
+		// Visible at the default log level so missing-digest configs are
+		// noticed; silent acceptance was the historical bug.
+		xlog.Warn("downloading without integrity check — supplied SHA is empty",
+			"file", filePath,
+			"url", url,
+		)
+	}
+
 	err = os.Rename(tmpFilePath, filePath)
 	if err != nil {
 		return fmt.Errorf("failed to rename temporary file %s -> %s: %v", tmpFilePath, filePath, err)
 	}
 
-	if sha != "" {
-		// Verify SHA
-		calculatedSHA := fmt.Sprintf("%x", progress.hash.Sum(nil))
-		if calculatedSHA != sha {
-			log.Debug().Msgf("SHA mismatch for file %q ( calculated: %s != metadata: %s )", filePath, calculatedSHA, sha)
-			return fmt.Errorf("SHA mismatch for file %q ( calculated: %s != metadata: %s )", filePath, calculatedSHA, sha)
-		}
-	} else {
-		log.Debug().Msgf("SHA missing for %q. Skipping validation", filePath)
-	}
-
-	log.Info().Msgf("File %q downloaded and verified", filePath)
+	xlog.Info("File downloaded and verified", "file", filePath)
 	if utils.IsArchive(filePath) {
 		basePath := filepath.Dir(filePath)
-		log.Info().Msgf("File %q is an archive, uncompressing to %s", filePath, basePath)
+		xlog.Info("File is an archive, uncompressing", "file", filePath, "basePath", basePath)
 		if err := utils.ExtractArchive(filePath, basePath); err != nil {
-			log.Debug().Msgf("Failed decompressing %q: %s", filePath, err.Error())
+			xlog.Debug("Failed decompressing", "file", filePath, "error", err)
 			return err
 		}
 	}
@@ -513,7 +699,7 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-func calculateSHA(filePath string) (string, error) {
+func CalculateSHA(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err

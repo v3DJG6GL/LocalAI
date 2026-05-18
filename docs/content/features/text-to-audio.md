@@ -1,7 +1,7 @@
 
 +++
 disableToc = false
-title = "🗣 Text to audio (TTS)"
+title = "Text to Audio (TTS)"
 weight = 11
 url = "/features/text-to-audio/"
 +++
@@ -29,6 +29,41 @@ curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{
 
 Returns an `audio/wav` file.
 
+## Streaming TTS
+
+LocalAI supports streaming TTS generation, allowing audio to be played as it's generated. This is useful for real-time applications and reduces latency.
+
+To enable streaming, add `"stream": true` to your request:
+
+```bash
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{
+  "input": "Hello world, this is a streaming test",
+  "model": "voxcpm",
+  "stream": true
+}' | aplay
+```
+
+The audio will be streamed chunk-by-chunk as it's generated, allowing playback to start before generation completes. This is particularly useful for long texts or when you want to minimize perceived latency.
+
+You can also pipe the streamed audio directly to audio players like `aplay` (Linux) or save it to a file:
+
+```bash
+# Stream to aplay (Linux)
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{
+  "input": "This is a longer text that will be streamed as it is generated",
+  "model": "voxcpm",
+  "stream": true
+}' | aplay
+
+# Stream to a file
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{
+  "input": "Streaming audio to file",
+  "model": "voxcpm",
+  "stream": true
+}' > output.wav
+```
+
+Note: Streaming TTS is currently supported by the `voxcpm` backend. Other backends will fall back to non-streaming mode if streaming is not supported.
 
 ## Backends
 
@@ -49,37 +84,6 @@ Coqui works without any configuration, to test it, you can run the following cur
 You can use the env variable COQUI_LANGUAGE to set the language used by the coqui backend.
 
 You can also use config files to configure tts models (see section below on how to use config files).
-
-### Bark
-
-[Bark](https://github.com/suno-ai/bark) allows to generate audio from text prompts.
-
-This is an extra backend - in the container is already available and there is nothing to do for the setup.
-
-#### Model setup
-
-There is nothing to be done for the model setup. You can already start to use bark. The models will be downloaded the first time you use the backend.
-
-#### Usage
-
-Use the `tts` endpoint by specifying the `bark` backend:
-
-```
-curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
-     "backend": "bark",
-     "input":"Hello!"
-   }' | aplay
-```
-
-To specify a voice from https://github.com/suno-ai/bark#-voice-presets ( https://suno-ai.notion.site/8b8e8749ed514b0cbf3f699013548683?v=bc67cff786b04b50b3ceb756fd05f68c ), use the `model` parameter:
-
-```
-curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
-     "backend": "bark",
-     "input":"Hello!",
-     "model": "v2/en_speaker_4"
-   }' | aplay
-```
 
 ### Piper
 
@@ -122,54 +126,292 @@ curl --request POST \
 
 Future versions of LocalAI will expose additional control over audio generation beyond the text prompt.
 
-### Vall-E-X
+### ACE-Step
 
-[VALL-E-X](https://github.com/Plachtaa/VALL-E-X) is an open source implementation of Microsoft's VALL-E X zero-shot TTS model.
+[ACE-Step 1.5](https://github.com/ACE-Step/ACE-Step-1.5) is a music generation model that can create music from text descriptions, lyrics, or audio samples. It supports both simple text-to-music and advanced music generation with metadata like BPM, key scale, and time signature.
 
 #### Setup
 
-The backend will automatically download the required files in order to run the model.
-
-This is an extra backend - in the container is already available and there is nothing to do for the setup. If you are building manually, you need to install Vall-E-X manually first.
+Install the `ace-step-turbo` model from the Model gallery or run `local-ai run models install ace-step-turbo`.
 
 #### Usage
 
-Use the tts endpoint by specifying the vall-e-x backend:
+ACE-Step supports two modes: **Simple mode** (text description + vocal language) and **Advanced mode** (caption, lyrics, BPM, key, and more).
+
+**Simple mode:**
+```bash
+curl http://localhost:8080/v1/audio/speech -H "Content-Type: application/json" -d '{
+  "model": "ace-step-turbo",
+  "input": "A soft Bengali love song for a quiet evening",
+  "vocal_language": "bn"
+}' --output music.flac
+```
+
+**Advanced mode** (using the `/sound` endpoint):
+```bash
+curl http://localhost:8080/sound -H "Content-Type: application/json" -d '{
+  "model": "ace-step-turbo",
+  "caption": "A funky Japanese disco track",
+  "lyrics": "[Verse 1]\n...",
+  "bpm": 120,
+  "keyscale": "Ab major",
+  "language": "ja",
+  "duration_seconds": 225
+}' --output music.flac
+```
+
+#### Configuration
+
+You can configure ACE-Step models with various options:
+
+```yaml
+name: ace-step-turbo
+backend: ace-step
+parameters:
+  model: acestep-v15-turbo
+known_usecases:
+  - sound_generation
+  - tts
+options:
+  - "device:auto"
+  - "use_flash_attention:true"
+  - "init_lm:true"  # Enable LLM for enhanced generation
+  - "lm_model_path:acestep-5Hz-lm-0.6B"  # or acestep-5Hz-lm-4B
+  - "lm_backend:pt"  # or vllm
+  - "temperature:0.85"
+  - "top_p:0.9"
+  - "inference_steps:8"
+  - "guidance_scale:7.0"
+```
+
+### VibeVoice
+
+[VibeVoice-Realtime](https://github.com/microsoft/VibeVoice) is a real-time text-to-speech model that generates natural-sounding speech with voice cloning capabilities.
+
+#### Setup
+
+Install the `vibevoice` model in the Model gallery or run `local-ai run models install vibevoice`.
+
+#### Usage
+
+Use the tts endpoint by specifying the vibevoice backend:
 
 ```
 curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
-     "backend": "vall-e-x",
+     "model": "vibevoice",
      "input":"Hello!"
    }' | aplay
 ```
 
 #### Voice cloning
 
-In order to use voice cloning capabilities you must create a `YAML` configuration file to setup a model:
+VibeVoice supports voice cloning through voice preset files. You can configure a model with a specific voice:
 
 ```yaml
-name: cloned-voice
-backend: vall-e-x
+name: vibevoice
+backend: vibevoice
 parameters:
-  model: "cloned-voice"
+  model: microsoft/VibeVoice-Realtime-0.5B
 tts:
-    vall-e:
-      # The path to the audio file to be cloned
-      # relative to the models directory
-      # Max 15s
-      audio_path: "audio-sample.wav"
+  voice: "Frank"  # or use audio_path to specify a .pt file path
+  # Available English voices: Carter, Davis, Emma, Frank, Grace, Mike
 ```
 
-Then you can specify the model name in the requests:
+Then you can use the model:
 
 ```
 curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
-     "model": "cloned-voice",
+     "model": "vibevoice",
      "input":"Hello!"
    }' | aplay
 ```
 
-## Using config files
+### Pocket TTS
+
+[Pocket TTS](https://github.com/kyutai-labs/pocket-tts) is a lightweight text-to-speech model designed to run efficiently on CPUs. It supports voice cloning through HuggingFace voice URLs or local audio files.
+
+#### Setup
+
+Install the `pocket-tts` model in the Model gallery or run `local-ai run models install pocket-tts`.
+
+#### Usage
+
+Use the tts endpoint by specifying the pocket-tts backend:
+
+```
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
+     "model": "pocket-tts",
+     "input":"Hello world, this is a test."
+   }' | aplay
+```
+
+#### Voice cloning
+
+Pocket TTS supports voice cloning through built-in voice names, HuggingFace URLs, or local audio files. You can configure a model with a specific voice:
+
+```yaml
+name: pocket-tts
+backend: pocket-tts
+tts:
+  voice: "azelma"  # Built-in voice name
+  # Or use HuggingFace URL: "hf://kyutai/tts-voices/alba-mackenna/casual.wav"
+  # Or use local file path: "path/to/voice.wav"
+  # Available built-in voices: alba, marius, javert, jean, fantine, cosette, eponine, azelma
+```
+
+You can also pre-load a default voice for faster first generation:
+
+```yaml
+name: pocket-tts
+backend: pocket-tts
+options:
+  - "default_voice:azelma"  # Pre-load this voice when model loads
+```
+
+Then you can use the model:
+
+```
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
+     "model": "pocket-tts",
+     "input":"Hello world, this is a test."
+   }' | aplay
+```
+
+### Qwen3-TTS
+
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) is a high-quality text-to-speech model that supports three modes: custom voice (predefined speakers), voice design (natural language instructions), and voice cloning (from reference audio).
+
+#### Setup
+
+Install the `qwen-tts` model in the Model gallery or run `local-ai run models install qwen-tts`.
+
+#### Usage
+
+Use the tts endpoint by specifying the qwen-tts backend:
+
+```
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
+     "model": "qwen-tts",
+     "input":"Hello world, this is a test."
+   }' | aplay
+```
+
+#### Custom Voice Mode
+
+Qwen3-TTS supports predefined speakers. You can specify a speaker using the `voice` parameter:
+
+```yaml
+name: qwen-tts
+backend: qwen-tts
+parameters:
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+tts:
+  voice: "Vivian"  # Available speakers: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee
+```
+
+Available speakers:
+- **Chinese**: Vivian, Serena, Uncle_Fu, Dylan, Eric
+- **English**: Ryan, Aiden
+- **Japanese**: Ono_Anna
+- **Korean**: Sohee
+
+#### Voice Design Mode
+
+Voice Design allows you to create custom voices using natural language instructions. Configure the model with an `instruct` option:
+
+```yaml
+name: qwen-tts-design
+backend: qwen-tts
+parameters:
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+options:
+  - "instruct:体现撒娇稚嫩的萝莉女声，音调偏高且起伏明显，营造出黏人、做作又刻意卖萌的听觉效果。"
+```
+
+Then use the model:
+
+```
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
+     "model": "qwen-tts-design",
+     "input":"Hello world, this is a test."
+   }' | aplay
+```
+
+#### Voice Clone Mode
+
+Voice Clone allows you to clone a voice from reference audio. Configure the model with an `AudioPath` and optional `ref_text`:
+
+```yaml
+name: qwen-tts-clone
+backend: qwen-tts
+parameters:
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+tts:
+  audio_path: "path/to/reference_audio.wav"  # Reference audio file
+options:
+  - "ref_text:This is the transcript of the reference audio."
+  - "x_vector_only_mode:false"  # Set to true to use only speaker embedding (ref_text not required)
+```
+
+You can also use URLs or base64 strings for the reference audio. The backend automatically detects the mode based on available parameters (AudioPath → VoiceClone, instruct option → VoiceDesign, voice parameter → CustomVoice).
+
+Then use the model:
+
+```
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
+     "model": "qwen-tts-clone",
+     "input":"Hello world, this is a test."
+   }' | aplay
+```
+
+#### Multi-Voice Clone Mode
+
+Qwen3-TTS also supports loading multiple voices for voice cloning, allowing you to select different voices at request time. Configure multiple voices using the `voices` option:
+
+```yaml
+name: qwen-tts-multi-voice
+backend: qwen-tts
+parameters:
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+options:
+  - voices:[{"name":"jane","audio":"voices/jane.wav","ref_text":"voices/jane-ref.txt"},{"name":"john","audio":"voices/john.wav","ref_text":"voices/john-ref.txt"}]
+```
+
+The `voices` option accepts a JSON array where each voice entry must have:
+- `name`: The voice identifier (used in API requests)
+- `audio`: Path to the reference audio file (relative to model directory or absolute)
+- `ref_text`: Path to the reference text file for the audio it is paired with
+
+Then use the model with voice selection:
+
+```bash
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
+     "model": "qwen-tts-multi-voice",
+     "input":"Hello world, this is Jane speaking.",
+     "voice": "jane"
+   }' | aplay
+
+# Switch to a different voice
+curl http://localhost:8080/tts -H "Content-Type: application/json" -d '{         
+     "model": "qwen-tts-multi-voice",
+     "input":"Hello world, this is John speaking.",
+     "voice": "john"
+   }' | aplay
+```
+
+**Voice Selection Priority:**
+1. `voice` parameter in the API request (highest priority)
+2. `voice` option in the model configuration
+3. Error if voice is not found among configured voices
+
+**Error Handling:**
+If you request a voice that doesn't exist in the voices list, the API will return an error with a list of available voices:
+```json
+{"error": "Voice 'unknown' not found. Available voices: jane, john"}
+```
+
+**Backward Compatibility:**
+The multi-voice mode is backward compatible with existing single-voice configurations. Models using `audio_path` in the `tts` section will continue to work as before.
 
 You can also use a `config-file` to specify TTS models and their parameters.
 

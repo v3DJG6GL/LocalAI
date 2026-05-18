@@ -3,7 +3,7 @@ package schema
 import (
 	"encoding/json"
 
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 
 	"github.com/mudler/LocalAI/pkg/grpc/proto"
 )
@@ -16,7 +16,7 @@ type Message struct {
 	Name string `json:"name,omitempty" yaml:"name"`
 
 	// The message content
-	Content interface{} `json:"content" yaml:"content"`
+	Content any `json:"content" yaml:"content"`
 
 	StringContent string   `json:"string_content,omitempty" yaml:"string_content,omitempty"`
 	StringImages  []string `json:"string_images,omitempty" yaml:"string_images,omitempty"`
@@ -24,9 +24,14 @@ type Message struct {
 	StringAudios  []string `json:"string_audios,omitempty" yaml:"string_audios,omitempty"`
 
 	// A result of a function call
-	FunctionCall interface{} `json:"function_call,omitempty" yaml:"function_call,omitempty"`
+	FunctionCall any `json:"function_call,omitempty" yaml:"function_call,omitempty"`
 
 	ToolCalls []ToolCall `json:"tool_calls,omitempty" yaml:"tool_call,omitempty"`
+
+	ToolCallID string `json:"tool_call_id,omitempty" yaml:"tool_call_id,omitempty"`
+
+	// Reasoning content extracted from <thinking>...</thinking> tags
+	Reasoning *string `json:"reasoning,omitempty" yaml:"reasoning,omitempty"`
 }
 
 type ToolCall struct {
@@ -56,7 +61,7 @@ func (messages Messages) ToProto() []*proto.Message {
 		switch ct := message.Content.(type) {
 		case string:
 			protoMessages[i].Content = ct
-		case []interface{}:
+		case []any:
 			// If using the tokenizer template, in case of multimodal we want to keep the multimodal content as and return only strings here
 			data, _ := json.Marshal(ct)
 			resultData := []struct {
@@ -72,14 +77,18 @@ func (messages Messages) ToProto() []*proto.Message {
 		if len(message.ToolCalls) > 0 {
 			toolCallsJSON, err := json.Marshal(message.ToolCalls)
 			if err != nil {
-				log.Warn().Err(err).Msg("failed to marshal tool_calls to JSON")
+				xlog.Warn("failed to marshal tool_calls to JSON", "error", err)
 			} else {
 				protoMessages[i].ToolCalls = string(toolCallsJSON)
 			}
 		}
 
-		// Note: tool_call_id and reasoning_content are not in schema.Message yet
-		// They may need to be added to schema.Message if needed in the future
+		if message.ToolCallID != "" {
+			protoMessages[i].ToolCallId = message.ToolCallID
+		}
+		if message.Reasoning != nil {
+			protoMessages[i].ReasoningContent = *message.Reasoning
+		}
 	}
 	return protoMessages
 }

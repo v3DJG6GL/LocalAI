@@ -2,6 +2,7 @@ package importers_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,7 +26,7 @@ var _ = Describe("DiscoverModelConfig", func() {
 			Expect(modelConfig.Description).To(Equal("Imported from https://huggingface.co/mudler/LocalAI-functioncall-qwen2.5-7b-v0.5-Q4_K_M-GGUF"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.ConfigFile).To(ContainSubstring("backend: llama-cpp"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(len(modelConfig.Files)).To(Equal(1), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.Files[0].Filename).To(Equal("llama-cpp/models/localai-functioncall-qwen2.5-7b-v0.5-q4_k_m.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.Files[0].Filename).To(Equal("llama-cpp/models/LocalAI-functioncall-qwen2.5-7b-v0.5-Q4_K_M-GGUF/localai-functioncall-qwen2.5-7b-v0.5-q4_k_m.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[0].URI).To(Equal("https://huggingface.co/mudler/LocalAI-functioncall-qwen2.5-7b-v0.5-Q4_K_M-GGUF/resolve/main/localai-functioncall-qwen2.5-7b-v0.5-q4_k_m.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[0].SHA256).To(Equal("4e7b7fe1d54b881f1ef90799219dc6cc285d29db24f559c8998d1addb35713d4"), fmt.Sprintf("Model config: %+v", modelConfig))
 		})
@@ -40,13 +41,13 @@ var _ = Describe("DiscoverModelConfig", func() {
 			Expect(modelConfig.Name).To(Equal("Qwen3-VL-2B-Instruct-GGUF"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Description).To(Equal("Imported from https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.ConfigFile).To(ContainSubstring("backend: llama-cpp"), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.ConfigFile).To(ContainSubstring("mmproj: llama-cpp/mmproj/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.ConfigFile).To(ContainSubstring("model: llama-cpp/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.ConfigFile).To(ContainSubstring("mmproj: llama-cpp/mmproj/Qwen3-VL-2B-Instruct-GGUF/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.ConfigFile).To(ContainSubstring("model: llama-cpp/models/Qwen3-VL-2B-Instruct-GGUF/Qwen3VL-2B-Instruct-Q4_K_M.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(len(modelConfig.Files)).To(Equal(2), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.Files[0].Filename).To(Equal("llama-cpp/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.Files[0].Filename).To(Equal("llama-cpp/models/Qwen3-VL-2B-Instruct-GGUF/Qwen3VL-2B-Instruct-Q4_K_M.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[0].URI).To(Equal("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q4_K_M.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[0].SHA256).ToNot(BeEmpty(), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.Files[1].Filename).To(Equal("llama-cpp/mmproj/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.Files[1].Filename).To(Equal("llama-cpp/mmproj/Qwen3-VL-2B-Instruct-GGUF/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[1].URI).To(Equal("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[1].SHA256).ToNot(BeEmpty(), fmt.Sprintf("Model config: %+v", modelConfig))
 		})
@@ -61,13 +62,13 @@ var _ = Describe("DiscoverModelConfig", func() {
 			Expect(modelConfig.Name).To(Equal("Qwen3-VL-2B-Instruct-GGUF"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Description).To(Equal("Imported from https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.ConfigFile).To(ContainSubstring("backend: llama-cpp"), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.ConfigFile).To(ContainSubstring("mmproj: llama-cpp/mmproj/mmproj-Qwen3VL-2B-Instruct-F16.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.ConfigFile).To(ContainSubstring("model: llama-cpp/models/Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.ConfigFile).To(ContainSubstring("mmproj: llama-cpp/mmproj/Qwen3-VL-2B-Instruct-GGUF/mmproj-Qwen3VL-2B-Instruct-F16.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.ConfigFile).To(ContainSubstring("model: llama-cpp/models/Qwen3-VL-2B-Instruct-GGUF/Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(len(modelConfig.Files)).To(Equal(2), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.Files[0].Filename).To(Equal("llama-cpp/models/Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.Files[0].Filename).To(Equal("llama-cpp/models/Qwen3-VL-2B-Instruct-GGUF/Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[0].URI).To(Equal("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3VL-2B-Instruct-Q8_0.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[0].SHA256).ToNot(BeEmpty(), fmt.Sprintf("Model config: %+v", modelConfig))
-			Expect(modelConfig.Files[1].Filename).To(Equal("llama-cpp/mmproj/mmproj-Qwen3VL-2B-Instruct-F16.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
+			Expect(modelConfig.Files[1].Filename).To(Equal("llama-cpp/mmproj/Qwen3-VL-2B-Instruct-GGUF/mmproj-Qwen3VL-2B-Instruct-F16.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[1].URI).To(Equal("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-F16.gguf"), fmt.Sprintf("Model config: %+v", modelConfig))
 			Expect(modelConfig.Files[1].SHA256).ToNot(BeEmpty(), fmt.Sprintf("Model config: %+v", modelConfig))
 		})
@@ -198,6 +199,99 @@ var _ = Describe("DiscoverModelConfig", func() {
 			// The exact behavior depends on implementation, but typically an error is returned
 			Expect(modelConfig.Name).To(BeEmpty())
 			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Context("ErrAmbiguousImport sentinel", func() {
+		It("is defined so callers can match with errors.Is", func() {
+			Expect(importers.ErrAmbiguousImport).ToNot(BeNil())
+			// Wrapping-sanity: fmt.Errorf("%w", err) preserves identity.
+			wrapped := fmt.Errorf("context: %w", importers.ErrAmbiguousImport)
+			Expect(errors.Is(wrapped, importers.ErrAmbiguousImport)).To(BeTrue())
+		})
+
+		It("surfaces modality and candidates on the typed error for HTTP consumers", func() {
+			// TTS fixture — pipeline_tag=text-to-speech, no importer matches.
+			uri := "https://huggingface.co/nari-labs/Dia-1.6B"
+			preferences := json.RawMessage(`{}`)
+
+			_, err := importers.DiscoverModelConfig(uri, preferences)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.Is(err, importers.ErrAmbiguousImport)).To(BeTrue())
+
+			var amb *importers.AmbiguousImportError
+			Expect(errors.As(err, &amb)).To(BeTrue(), "expected AmbiguousImportError, got: %v", err)
+			Expect(amb.Modality).To(Equal("tts"))
+			Expect(amb.Candidates).To(ContainElements("piper", "bark", "kokoro"))
+			Expect(amb.Candidates).ToNot(ContainElement("llama-cpp"))
+		})
+	})
+
+	Context("Importer interface metadata", func() {
+		// These tests drive the /backends/known endpoint: each importer must
+		// self-describe its canonical name, primary modality, and whether it
+		// can auto-detect without an explicit preference.
+		It("Registry returns all default importers", func() {
+			registry := importers.Registry()
+			Expect(registry).ToNot(BeEmpty())
+			names := make([]string, 0, len(registry))
+			for _, imp := range registry {
+				names = append(names, imp.Name())
+			}
+			Expect(names).To(ContainElements("llama-cpp", "mlx", "vllm", "transformers", "diffusers"))
+		})
+
+		It("LlamaCPPImporter exposes name/modality/autodetect", func() {
+			imp := &importers.LlamaCPPImporter{}
+			Expect(imp.Name()).To(Equal("llama-cpp"))
+			Expect(imp.Modality()).To(Equal("text"))
+			Expect(imp.AutoDetects()).To(BeTrue())
+		})
+
+		It("MLXImporter exposes name/modality/autodetect", func() {
+			imp := &importers.MLXImporter{}
+			Expect(imp.Name()).To(Equal("mlx"))
+			Expect(imp.Modality()).To(Equal("text"))
+			Expect(imp.AutoDetects()).To(BeTrue())
+		})
+
+		It("VLLMImporter exposes name/modality/autodetect", func() {
+			imp := &importers.VLLMImporter{}
+			Expect(imp.Name()).To(Equal("vllm"))
+			Expect(imp.Modality()).To(Equal("text"))
+			Expect(imp.AutoDetects()).To(BeTrue())
+		})
+
+		It("TransformersImporter exposes name/modality/autodetect", func() {
+			imp := &importers.TransformersImporter{}
+			Expect(imp.Name()).To(Equal("transformers"))
+			Expect(imp.Modality()).To(Equal("text"))
+			Expect(imp.AutoDetects()).To(BeTrue())
+		})
+
+		It("DiffuserImporter exposes name/modality/autodetect", func() {
+			imp := &importers.DiffuserImporter{}
+			Expect(imp.Name()).To(Equal("diffusers"))
+			Expect(imp.Modality()).To(Equal("image"))
+			Expect(imp.AutoDetects()).To(BeTrue())
+		})
+
+		It("LlamaCPPImporter advertises drop-in replacements", func() {
+			imp := &importers.LlamaCPPImporter{}
+			provider, ok := any(imp).(importers.AdditionalBackendsProvider)
+			Expect(ok).To(BeTrue(), "LlamaCPPImporter must implement AdditionalBackendsProvider")
+
+			extras := provider.AdditionalBackends()
+			names := make([]string, 0, len(extras))
+			modalities := make([]string, 0, len(extras))
+			for _, e := range extras {
+				names = append(names, e.Name)
+				modalities = append(modalities, e.Modality)
+			}
+			Expect(names).To(ContainElements("ik-llama-cpp", "turboquant"))
+			for _, m := range modalities {
+				Expect(m).To(Equal("text"))
+			}
 		})
 	})
 

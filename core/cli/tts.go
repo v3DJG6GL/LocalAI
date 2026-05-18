@@ -12,7 +12,7 @@ import (
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/system"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 type TTSCMD struct {
@@ -53,7 +53,7 @@ func (t *TTSCMD) Run(ctx *cliContext.Context) error {
 	defer func() {
 		err := ml.StopAllGRPC()
 		if err != nil {
-			log.Error().Err(err).Msg("unable to stop all grpc processes")
+			xlog.Error("unable to stop all grpc processes", "error", err)
 		}
 	}()
 
@@ -62,7 +62,7 @@ func (t *TTSCMD) Run(ctx *cliContext.Context) error {
 	options.Backend = t.Backend
 	options.Model = t.Model
 
-	filePath, _, err := backend.ModelTTS(text, t.Voice, t.Language, ml, opts, options)
+	filePath, _, err := backend.ModelTTS(context.Background(), text, t.Voice, t.Language, ml, opts, options)
 	if err != nil {
 		return err
 	}

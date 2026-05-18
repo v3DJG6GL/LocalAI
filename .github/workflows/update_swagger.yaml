@@ -5,11 +5,14 @@ on:
   workflow_dispatch:
 jobs:
   swagger:
+    if: github.repository == 'mudler/LocalAI'
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Configure apt mirror on runner
+        uses: ./.github/actions/configure-apt-mirror
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'

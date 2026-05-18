@@ -8,14 +8,14 @@ import (
 
 	cliContext "github.com/mudler/LocalAI/core/cli/context"
 	"github.com/mudler/LocalAI/core/config"
-	"github.com/mudler/LocalAI/core/services"
+	"github.com/mudler/LocalAI/core/services/galleryop"
 
 	"github.com/mudler/LocalAI/core/gallery"
 	"github.com/mudler/LocalAI/core/startup"
 	"github.com/mudler/LocalAI/pkg/downloader"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/system"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -32,6 +32,7 @@ type ModelsList struct {
 
 type ModelsInstall struct {
 	DisablePredownloadScan   bool     `env:"LOCALAI_DISABLE_PREDOWNLOAD_SCAN" help:"If true, disables the best-effort security scanner before downloading any files." group:"hardening" default:"false"`
+	RequireBackendIntegrity  bool     `env:"LOCALAI_REQUIRE_BACKEND_INTEGRITY,REQUIRE_BACKEND_INTEGRITY" help:"If true, reject backend installs without a configured signature verification policy (OCI URIs) or SHA256 (tarball/HTTP URIs)." group:"hardening" default:"false"`
 	AutoloadBackendGalleries bool     `env:"LOCALAI_AUTOLOAD_BACKEND_GALLERIES" help:"If true, automatically loads backend galleries" group:"backends" default:"true"`
 	ModelArgs                []string `arg:"" optional:"" name:"models" help:"Model configuration URLs to load"`
 
@@ -46,7 +47,7 @@ type ModelsCMD struct {
 func (ml *ModelsList) Run(ctx *cliContext.Context) error {
 	var galleries []config.Gallery
 	if err := json.Unmarshal([]byte(ml.Galleries), &galleries); err != nil {
-		log.Error().Err(err).Msg("unable to load galleries")
+		xlog.Error("unable to load galleries", "error", err)
 	}
 
 	systemState, err := system.GetSystemState(
@@ -71,7 +72,6 @@ func (ml *ModelsList) Run(ctx *cliContext.Context) error {
 }
 
 func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
-
 	systemState, err := system.GetSystemState(
 		system.WithModelPath(mi.ModelsPath),
 		system.WithBackendPath(mi.BackendsPath),
@@ -80,7 +80,9 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 		return err
 	}
 
-	galleryService := services.NewGalleryService(&config.ApplicationConfig{}, model.NewModelLoader(systemState))
+	galleryService := galleryop.NewGalleryService(&config.ApplicationConfig{
+		SystemState: systemState,
+	}, model.NewModelLoader(systemState))
 	err = galleryService.Start(context.Background(), config.NewModelConfigLoader(mi.ModelsPath), systemState)
 	if err != nil {
 		return err
@@ -88,12 +90,12 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 
 	var galleries []config.Gallery
 	if err := json.Unmarshal([]byte(mi.Galleries), &galleries); err != nil {
-		log.Error().Err(err).Msg("unable to load galleries")
+		xlog.Error("unable to load galleries", "error", err)
 	}
 
 	var backendGalleries []config.Gallery
 	if err := json.Unmarshal([]byte(mi.BackendGalleries), &backendGalleries); err != nil {
-		log.Error().Err(err).Msg("unable to load backend galleries")
+		xlog.Error("unable to load backend galleries", "error", err)
 	}
 
 	for _, modelName := range mi.ModelArgs {
@@ -108,7 +110,7 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 			v := int(percentage * 10)
 			err := progressBar.Set(v)
 			if err != nil {
-				log.Error().Err(err).Str("filename", fileName).Int("value", v).Msg("error while updating progress bar")
+				xlog.Error("error while updating progress bar", "error", err, "filename", fileName, "value", v)
 			}
 		}
 		//startup.InstallModels()
@@ -122,7 +124,7 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 		if !modelURI.LooksLikeOCI() {
 			model := gallery.FindGalleryElement(models, modelName)
 			if model == nil {
-				log.Error().Str("model", modelName).Msg("model not found")
+				xlog.Error("model not found", "model", modelName)
 				return err
 			}
 
@@ -130,12 +132,10 @@ func (mi *ModelsInstall) Run(ctx *cliContext.Context) error {
 			if err != nil && !errors.Is(err, downloader.ErrNonHuggingFaceFile) {
 				return err
 			}
-
-			log.Info().Str("model", modelName).Str("license", model.License).Msg("installing model")
 		}
 
 		modelLoader := model.NewModelLoader(systemState)
-		err = startup.InstallModels(context.Background(), galleryService, galleries, backendGalleries, systemState, modelLoader, !mi.DisablePredownloadScan, mi.AutoloadBackendGalleries, progressCallback, modelName)
+		err = startup.InstallModels(context.Background(), galleryService, galleries, backendGalleries, systemState, modelLoader, !mi.DisablePredownloadScan, mi.AutoloadBackendGalleries, mi.RequireBackendIntegrity, progressCallback, modelName)
 		if err != nil {
 			return err
 		}

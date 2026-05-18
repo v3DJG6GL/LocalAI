@@ -16,4 +16,13 @@ if [ "x${BUILD_PROFILE}" == "xintel" ]; then
     EXTRA_PIP_INSTALL_FLAGS+=" --upgrade --index-strategy=unsafe-first-match"
 fi
 
+if [ "x${BUILD_PROFILE}" == "xl4t12" ]; then
+    USE_PIP=true
+fi
+
 installRequirements
+
+# spaCy is a dependency of misaki (used by kokoro for English phonemization).
+# Pre-download the model here because at runtime the portable Python environment
+# has no pip/uv, so spacy's auto-download would fail.
+python -m spacy download en_core_web_sm

@@ -8,9 +8,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/mudler/LocalAI/core/cli"
 	"github.com/mudler/LocalAI/internal"
-
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 
 	_ "github.com/mudler/LocalAI/swagger"
 )
@@ -18,9 +16,8 @@ import (
 func main() {
 	var err error
 
-	// Initialize zerolog at a level of INFO, we will set the desired level after we parse the CLI options
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	// Initialize xlog at a level of INFO, we will set the desired level after we parse the CLI options
+	xlog.SetLogger(xlog.NewLogger(xlog.LogLevel("info"), "text"))
 
 	// handle loading environment variables from .env files
 	envFiles := []string{".env", "localai.env"}
@@ -32,34 +29,30 @@ func main() {
 
 	for _, envFile := range envFiles {
 		if _, err := os.Stat(envFile); err == nil {
-			log.Debug().Str("envFile", envFile).Msg("env file found, loading environment variables from file")
+			xlog.Debug("env file found, loading environment variables from file", "envFile", envFile)
 			err = godotenv.Load(envFile)
 			if err != nil {
-				log.Error().Err(err).Str("envFile", envFile).Msg("failed to load environment variables from file")
+				xlog.Error("failed to load environment variables from file", "error", err, "envFile", envFile)
 				continue
 			}
 		}
 	}
 
 	// Actually parse the CLI options
-	ctx := kong.Parse(&cli.CLI,
+	k := kong.Must(&cli.CLI,
 		kong.Description(
 			`  LocalAI is a drop-in replacement OpenAI API for running LLM, GPT and genAI models locally on CPU, GPUs with consumer grade hardware.
 
-Some of the models compatible are:
-  - Vicuna
-  - Koala
-  - GPT4ALL
-  - GPT4ALL-J
-  - Cerebras
-  - Alpaca
-  - StableLM (ggml quantized)
-
-For a list of all available models for one-click install, check out: https://models.localai.io
+For a list of all available models run local-ai models list
 
 Copyright: Ettore Di Giacinto
 
 Version: ${version}
+
+For documentation and support:
+  Documentation: https://localai.io/
+  Getting Started: https://localai.io/basics/getting_started/
+  GitHub Issues: https://github.com/mudler/LocalAI/issues
 `,
 		),
 		kong.UsageOnError(),
@@ -70,13 +63,19 @@ Version: ${version}
 			"version":   internal.PrintableVersion(),
 		},
 	)
+	ctx, err := k.Parse(os.Args[1:])
+	if err != nil {
+		k.FatalIfErrorf(err)
+	}
+
+	// Pass Kong model to the completion command for dynamic script generation
+	cli.CLI.Completion.SetApplication(k.Model)
 
 	// Configure the logging level before we run the application
 	// This is here to preserve the existing --debug flag functionality
 	logLevel := "info"
 	if cli.CLI.Debug && cli.CLI.LogLevel == nil {
 		logLevel = "debug"
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 		cli.CLI.LogLevel = &logLevel
 	}
 
@@ -84,27 +83,22 @@ Version: ${version}
 		cli.CLI.LogLevel = &logLevel
 	}
 
-	switch *cli.CLI.LogLevel {
-	case "error":
-		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-		log.Debug().Msg("Setting logging to error")
-	case "warn":
-		zerolog.SetGlobalLevel(zerolog.WarnLevel)
-		log.Debug().Msg("Setting logging to warn")
-	case "info":
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-		log.Debug().Msg("Setting logging to info")
-	case "debug":
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-		log.Debug().Msg("Setting logging to debug")
-	case "trace":
-		zerolog.SetGlobalLevel(zerolog.TraceLevel)
-		log.Debug().Msg("Setting logging to trace")
+	// Set xlog logger with the desired level and text format.
+	// xlog auto-enables log deduplication when output is a terminal.
+	var logOpts []xlog.LoggerOption
+	if cli.CLI.LogDedupLogs != nil {
+		if *cli.CLI.LogDedupLogs {
+			logOpts = append(logOpts, xlog.WithDedup())
+		} else {
+			logOpts = append(logOpts, xlog.WithoutDedup())
+		}
 	}
+
+	xlog.SetLogger(xlog.NewLogger(xlog.LogLevel(*cli.CLI.LogLevel), *cli.CLI.LogFormat, logOpts...))
 
 	// Run the thing!
 	err = ctx.Run(&cli.CLI.Context)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Error running the application")
+		xlog.Fatal("Error running the application", "error", err)
 	}
 }

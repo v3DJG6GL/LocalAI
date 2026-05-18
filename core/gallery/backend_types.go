@@ -2,10 +2,11 @@ package gallery
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/system"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // BackendMetadata represents the metadata stored in a JSON file for each installed backend
@@ -20,14 +21,24 @@ type BackendMetadata struct {
 	GalleryURL string `json:"gallery_url,omitempty"`
 	// InstalledAt is the timestamp when the backend was installed
 	InstalledAt string `json:"installed_at,omitempty"`
+	// Version is the version of the backend at install time
+	Version string `json:"version,omitempty"`
+	// URI is the original URI used to install the backend
+	URI string `json:"uri,omitempty"`
+	// Digest is the OCI image digest at install time (for upgrade detection)
+	Digest string `json:"digest,omitempty"`
 }
 
 type GalleryBackend struct {
 	Metadata        `json:",inline" yaml:",inline"`
 	Alias           string            `json:"alias,omitempty" yaml:"alias,omitempty"`
 	URI             string            `json:"uri,omitempty" yaml:"uri,omitempty"`
+	Version         string            `json:"version,omitempty" yaml:"version,omitempty"`
 	Mirrors         []string          `json:"mirrors,omitempty" yaml:"mirrors,omitempty"`
 	CapabilitiesMap map[string]string `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
+	// SHA256 is the expected sha256 of the backend tarball at URI / Mirrors.
+	// Empty disables the integrity check; OCI URIs carry their own digest.
+	SHA256 string `json:"sha256,omitempty" yaml:"sha256,omitempty"`
 }
 
 func (backend *GalleryBackend) FindBestBackendFromMeta(systemState *system.SystemState, backends GalleryElements[*GalleryBackend]) *GalleryBackend {
@@ -37,11 +48,11 @@ func (backend *GalleryBackend) FindBestBackendFromMeta(systemState *system.Syste
 
 	realBackend := backend.CapabilitiesMap[systemState.Capability(backend.CapabilitiesMap)]
 	if realBackend == "" {
-		log.Debug().Str("backend", backend.Name).Str("reportedCapability", systemState.Capability(backend.CapabilitiesMap)).Msg("No backend found for reported capability")
+		xlog.Debug("No backend found for reported capability", "backend", backend.Name, "reportedCapability", systemState.Capability(backend.CapabilitiesMap))
 		return nil
 	}
 
-	log.Debug().Str("backend", backend.Name).Str("reportedCapability", systemState.Capability(backend.CapabilitiesMap)).Msg("Found backend for reported capability")
+	xlog.Debug("Found backend for reported capability", "backend", backend.Name, "reportedCapability", systemState.Capability(backend.CapabilitiesMap))
 	return backends.FindByName(realBackend)
 }
 
@@ -61,6 +72,36 @@ func (m *GalleryBackend) SetGallery(gallery config.Gallery) {
 
 func (m *GalleryBackend) IsMeta() bool {
 	return len(m.CapabilitiesMap) > 0 && m.URI == ""
+}
+
+func (m *GalleryBackend) IsDevelopment(devSuffix string) bool {
+	if devSuffix == "" {
+		devSuffix = defaultDevSuffix
+	}
+	return strings.HasSuffix(m.Name, "-"+devSuffix)
+}
+
+// IsCompatibleWith checks if the backend is compatible with the current system capability.
+// For meta backends, it checks if any of the capabilities in the map match the system capability.
+// For concrete backends, it delegates to SystemState.IsBackendCompatible.
+func (m *GalleryBackend) IsCompatibleWith(systemState *system.SystemState) bool {
+	if systemState == nil {
+		return true
+	}
+
+	if systemState.CapabilityFilterDisabled() {
+		return true
+	}
+
+	// Meta backends are compatible if the system capability matches one of the keys
+	if m.IsMeta() {
+		capability := systemState.Capability(m.CapabilitiesMap)
+		_, exists := m.CapabilitiesMap[capability]
+		return exists
+	}
+
+	// For concrete backends, delegate to the system package
+	return systemState.IsBackendCompatible(m.Name, m.URI)
 }
 
 func (m *GalleryBackend) SetInstalled(installed bool) {

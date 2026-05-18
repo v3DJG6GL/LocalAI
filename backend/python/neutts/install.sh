@@ -26,7 +26,20 @@ fi
 
 EXTRA_PIP_INSTALL_FLAGS+=" --no-build-isolation"
 
-git clone https://github.com/neuphonic/neutts-air neutts-air
+
+if [ "x${BUILD_PROFILE}" == "xl4t12" ]; then
+    USE_PIP=true
+fi
+
+
+git clone --depth 100 https://github.com/neuphonic/neutts-air neutts-air
+
+cd neutts-air
+
+git checkout 1737487debe5b40a0bb97875edce8c66b391722b
+
+cd ..
+
 
 cp -rfv neutts-air/neuttsair ./
 

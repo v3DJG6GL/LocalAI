@@ -1,13 +1,13 @@
 package model
 
 import (
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/mudler/LocalAI/pkg/xsysinfo"
 	process "github.com/mudler/go-processmanager"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // WatchDog tracks all the requests from GRPC clients.
@@ -33,6 +33,7 @@ type WatchDog struct {
 	addressModelMap      map[string]string
 	pm                   ProcessManager
 	stop                 chan bool
+	done                 chan bool // Signals when Run() has completely shut down
 
 	busyCheck, idleCheck bool
 	lruLimit             int // Maximum number of active backends (0 = unlimited)
@@ -41,6 +42,17 @@ type WatchDog struct {
 	memoryReclaimerEnabled   bool    // Enable memory threshold monitoring
 	memoryReclaimerThreshold float64 // Threshold 0.0-1.0 (e.g., 0.95 = 95%)
 	watchdogInterval         time.Duration
+
+	// Eviction settings
+	forceEvictionWhenBusy bool // Force eviction even when models have active API calls (default: false for safety)
+
+	// Pinned models are excluded from idle, LRU, and memory-pressure eviction
+	pinnedModels map[string]bool
+
+	// modelGroups maps a model name to its declared concurrency groups.
+	// Two loaded models that share at least one group cannot coexist on this
+	// node — see EnforceGroupExclusivity.
+	modelGroups map[string][]string
 }
 
 type ProcessManager interface {
@@ -74,10 +86,14 @@ func NewWatchDog(opts ...WatchDogOption) *WatchDog {
 		idleCheck:                o.idleCheck,
 		lruLimit:                 o.lruLimit,
 		addressModelMap:          make(map[string]string),
+		pinnedModels:             make(map[string]bool),
+		modelGroups:              make(map[string][]string),
 		stop:                     make(chan bool, 1),
+		done:                     make(chan bool, 1),
 		memoryReclaimerEnabled:   o.memoryReclaimerEnabled,
 		memoryReclaimerThreshold: o.memoryReclaimerThreshold,
 		watchdogInterval:         o.watchdogInterval,
+		forceEvictionWhenBusy:    o.forceEvictionWhenBusy,
 	}
 }
 
@@ -110,11 +126,70 @@ func (wd *WatchDog) GetMemoryReclaimerSettings() (enabled bool, threshold float6
 	return wd.memoryReclaimerEnabled, wd.memoryReclaimerThreshold
 }
 
+// SetForceEvictionWhenBusy updates the force eviction when busy setting dynamically
+func (wd *WatchDog) SetForceEvictionWhenBusy(force bool) {
+	wd.Lock()
+	defer wd.Unlock()
+	wd.forceEvictionWhenBusy = force
+}
+
+// SetPinnedModels replaces the set of pinned model names.
+// Pinned models are excluded from idle, LRU, and memory-pressure eviction.
+func (wd *WatchDog) SetPinnedModels(models []string) {
+	wd.Lock()
+	defer wd.Unlock()
+	wd.pinnedModels = make(map[string]bool, len(models))
+	for _, m := range models {
+		wd.pinnedModels[m] = true
+	}
+}
+
+// IsModelPinned returns true if the given model name is pinned
+func (wd *WatchDog) IsModelPinned(modelName string) bool {
+	wd.Lock()
+	defer wd.Unlock()
+	return wd.pinnedModels[modelName]
+}
+
+// ReplaceModelGroups replaces the per-model concurrency-group registry. The
+// supplied map is copied; callers may mutate it after the call. Passing an
+// empty or nil map clears all entries.
+func (wd *WatchDog) ReplaceModelGroups(groups map[string][]string) {
+	wd.Lock()
+	defer wd.Unlock()
+	wd.modelGroups = make(map[string][]string, len(groups))
+	for name, gs := range groups {
+		if len(gs) == 0 {
+			continue
+		}
+		wd.modelGroups[name] = slices.Clone(gs)
+	}
+}
+
+// GetModelGroups returns a copy of the concurrency groups configured for
+// the given model, or nil if the model has no groups. The result may be
+// freely mutated by the caller.
+func (wd *WatchDog) GetModelGroups(modelName string) []string {
+	wd.Lock()
+	defer wd.Unlock()
+	gs, ok := wd.modelGroups[modelName]
+	if !ok || len(gs) == 0 {
+		return nil
+	}
+	return slices.Clone(gs)
+}
+
 func (wd *WatchDog) Shutdown() {
 	wd.Lock()
 	defer wd.Unlock()
-	log.Info().Msg("[WatchDog] Shutting down watchdog")
+	xlog.Info("[WatchDog] Shutting down watchdog")
 	wd.stop <- true
+}
+
+// WaitDone blocks until the watchdog's Run() goroutine has completely shut down.
+// This should be called after Shutdown() to ensure the watchdog is fully stopped.
+func (wd *WatchDog) WaitDone() {
+	<-wd.done
 }
 
 func (wd *WatchDog) AddAddressModelMap(address string, model string) {
@@ -162,6 +237,71 @@ func (wd *WatchDog) GetLoadedModelCount() int {
 	return len(wd.addressModelMap)
 }
 
+// WatchDogState holds the current state of models tracked by the watchdog
+type WatchDogState struct {
+	AddressModelMap map[string]string
+	BusyTime        map[string]time.Time
+	IdleTime        map[string]time.Time
+	LastUsed        map[string]time.Time
+	AddressMap      map[string]*process.Process
+}
+
+// GetState returns the current state of models tracked by the watchdog
+// This can be used to restore state when creating a new watchdog
+func (wd *WatchDog) GetState() WatchDogState {
+	wd.Lock()
+	defer wd.Unlock()
+
+	// Create copies to avoid race conditions
+	addressModelMap := make(map[string]string, len(wd.addressModelMap))
+	for k, v := range wd.addressModelMap {
+		addressModelMap[k] = v
+	}
+
+	busyTime := make(map[string]time.Time, len(wd.busyTime))
+	for k, v := range wd.busyTime {
+		busyTime[k] = v
+	}
+
+	idleTime := make(map[string]time.Time, len(wd.idleTime))
+	for k, v := range wd.idleTime {
+		idleTime[k] = v
+	}
+
+	lastUsed := make(map[string]time.Time, len(wd.lastUsed))
+	for k, v := range wd.lastUsed {
+		lastUsed[k] = v
+	}
+
+	addressMap := make(map[string]*process.Process, len(wd.addressMap))
+	for k, v := range wd.addressMap {
+		addressMap[k] = v
+	}
+
+	return WatchDogState{
+		AddressModelMap: addressModelMap,
+		BusyTime:        busyTime,
+		IdleTime:        idleTime,
+		LastUsed:        lastUsed,
+		AddressMap:      addressMap,
+	}
+}
+
+// RestoreState restores the model state from a previous watchdog
+// This should be called after the new watchdog is created but before Run() is started
+func (wd *WatchDog) RestoreState(state WatchDogState) {
+	wd.Lock()
+	defer wd.Unlock()
+
+	wd.addressModelMap = state.AddressModelMap
+	wd.busyTime = state.BusyTime
+	wd.idleTime = state.IdleTime
+	wd.lastUsed = state.LastUsed
+	wd.addressMap = state.AddressMap
+
+	xlog.Info("[WatchDog] Restored model state", "modelCount", len(wd.addressModelMap))
+}
+
 // modelUsageInfo holds information about a model's usage for LRU sorting
 type modelUsageInfo struct {
 	address  string
@@ -169,13 +309,19 @@ type modelUsageInfo struct {
 	lastUsed time.Time
 }
 
+// EnforceLRULimitResult contains the result of LRU enforcement
+type EnforceLRULimitResult struct {
+	EvictedCount int  // Number of models successfully evicted
+	NeedMore     bool // True if more evictions are needed but couldn't be done (e.g., all models are busy)
+}
+
 // EnforceLRULimit ensures we're under the LRU limit by evicting least recently used models.
 // This should be called before loading a new model.
 // pendingLoads is the number of models currently being loaded (to account for concurrent loads).
-// Returns the number of models evicted.
-func (wd *WatchDog) EnforceLRULimit(pendingLoads int) int {
+// Returns the result containing evicted count and whether more evictions are needed.
+func (wd *WatchDog) EnforceLRULimit(pendingLoads int) EnforceLRULimitResult {
 	if wd.lruLimit <= 0 {
-		return 0 // LRU disabled
+		return EnforceLRULimitResult{EvictedCount: 0, NeedMore: false} // LRU disabled
 	}
 
 	wd.Lock()
@@ -186,12 +332,13 @@ func (wd *WatchDog) EnforceLRULimit(pendingLoads int) int {
 	// We need: currentCount + pendingLoads + 1 <= lruLimit
 	// So evict: currentCount + pendingLoads + 1 - lruLimit = currentCount - lruLimit + pendingLoads + 1
 	modelsToEvict := currentCount - wd.lruLimit + pendingLoads + 1
+	forceEvictionWhenBusy := wd.forceEvictionWhenBusy
 	if modelsToEvict <= 0 {
 		wd.Unlock()
-		return 0
+		return EnforceLRULimitResult{EvictedCount: 0, NeedMore: false}
 	}
 
-	log.Debug().Int("current", currentCount).Int("pendingLoads", pendingLoads).Int("limit", wd.lruLimit).Int("toEvict", modelsToEvict).Msg("[WatchDog] LRU enforcement triggered")
+	xlog.Debug("[WatchDog] LRU enforcement triggered", "current", currentCount, "pendingLoads", pendingLoads, "limit", wd.lruLimit, "toEvict", modelsToEvict)
 
 	// Build a list of models sorted by last used time (oldest first)
 	var models []modelUsageInfo
@@ -209,39 +356,145 @@ func (wd *WatchDog) EnforceLRULimit(pendingLoads int) int {
 	}
 
 	// Sort by lastUsed time (oldest first)
-	sort.Slice(models, func(i, j int) bool {
-		return models[i].lastUsed.Before(models[j].lastUsed)
+	slices.SortFunc(models, func(a, b modelUsageInfo) int {
+		return a.lastUsed.Compare(b.lastUsed)
 	})
 
 	// Collect models to evict (the oldest ones)
-	var modelsToShutdown []string
-	for i := 0; i < modelsToEvict && i < len(models); i++ {
-		m := models[i]
-		log.Info().Str("model", m.model).Time("lastUsed", m.lastUsed).Msg("[WatchDog] LRU evicting model")
-		modelsToShutdown = append(modelsToShutdown, m.model)
-		// Clean up the maps while we have the lock
-		wd.untrack(m.address)
-	}
+	modelsToShutdown, skippedBusyCount := wd.collectEvictionsLocked(models, modelsToEvict, forceEvictionWhenBusy)
+	needMore := len(modelsToShutdown) < modelsToEvict && skippedBusyCount > 0
 	wd.Unlock()
 
 	// Now shutdown models without holding the watchdog lock to prevent deadlock
 	for _, model := range modelsToShutdown {
 		if err := wd.pm.ShutdownModel(model); err != nil {
-			log.Error().Err(err).Str("model", model).Msg("[WatchDog] error shutting down model during LRU eviction")
+			xlog.Error("[WatchDog] error shutting down model during LRU eviction", "error", err, "model", model)
 		}
-		log.Debug().Str("model", model).Msg("[WatchDog] LRU eviction complete")
+		xlog.Debug("[WatchDog] LRU eviction complete", "model", model)
 	}
 
-	return len(modelsToShutdown)
+	if needMore {
+		xlog.Warn("[WatchDog] LRU eviction incomplete", "evicted", len(modelsToShutdown), "needed", modelsToEvict, "skippedBusy", skippedBusyCount, "reason", "some models are busy with active API calls")
+	}
+
+	return EnforceLRULimitResult{
+		EvictedCount: len(modelsToShutdown),
+		NeedMore:     needMore,
+	}
+}
+
+// collectEvictionsLocked walks `candidates` (already in eviction order) and
+// untracks up to `maxToEvict` models that are eligible for eviction. Pinned
+// models are always skipped; busy models are skipped unless `force` is true.
+// Returns the names of evicted models and the number skipped because they
+// were busy. Must be called with wd.Lock() held.
+func (wd *WatchDog) collectEvictionsLocked(candidates []modelUsageInfo, maxToEvict int, force bool) (evicted []string, skippedBusy int) {
+	for i := 0; len(evicted) < maxToEvict && i < len(candidates); i++ {
+		m := candidates[i]
+		if wd.pinnedModels[m.model] {
+			xlog.Debug("[WatchDog] Skipping eviction for pinned model", "model", m.model)
+			continue
+		}
+		_, isBusy := wd.busyTime[m.address]
+		if isBusy && !force {
+			xlog.Warn("[WatchDog] Skipping eviction for busy model", "model", m.model, "reason", "model has active API calls")
+			skippedBusy++
+			continue
+		}
+		xlog.Info("[WatchDog] evicting model", "model", m.model, "busy", isBusy)
+		evicted = append(evicted, m.model)
+		wd.untrack(m.address)
+	}
+	return evicted, skippedBusy
+}
+
+// EnforceGroupExclusivity evicts every loaded model that shares at least one
+// concurrency group with the requested model. The pinned/busy/retry semantics
+// match EnforceLRULimit so the loader's retry loop can stay generic.
+func (wd *WatchDog) EnforceGroupExclusivity(requestedModel string) EnforceLRULimitResult {
+	wd.Lock()
+
+	requestedGroups := wd.modelGroups[requestedModel]
+	if len(requestedGroups) == 0 {
+		wd.Unlock()
+		return EnforceLRULimitResult{}
+	}
+
+	forceEvictionWhenBusy := wd.forceEvictionWhenBusy
+
+	// Build the conflict candidate list: every loaded model whose groups
+	// overlap with requestedGroups. Order doesn't affect correctness, but
+	// sort by lastUsed (oldest first) so logs and behaviour are deterministic.
+	var conflicts []modelUsageInfo
+	for address, name := range wd.addressModelMap {
+		if name == requestedModel {
+			continue
+		}
+		if !groupsOverlap(requestedGroups, wd.modelGroups[name]) {
+			continue
+		}
+		conflicts = append(conflicts, modelUsageInfo{
+			address:  address,
+			model:    name,
+			lastUsed: wd.lastUsed[address],
+		})
+	}
+	if len(conflicts) == 0 {
+		wd.Unlock()
+		return EnforceLRULimitResult{}
+	}
+	slices.SortFunc(conflicts, func(a, b modelUsageInfo) int {
+		return a.lastUsed.Compare(b.lastUsed)
+	})
+
+	xlog.Debug("[WatchDog] Group exclusivity triggered", "requested", requestedModel, "groups", requestedGroups, "conflicts", len(conflicts))
+
+	modelsToShutdown, skippedBusyCount := wd.collectEvictionsLocked(conflicts, len(conflicts), forceEvictionWhenBusy)
+	// For groups any unresolved conflict matters — busy *or* pinned. The loader
+	// retries on NeedMore; pinned cases will eventually time out and the load
+	// proceeds with a visible warning, which is the right signal for what is a
+	// configuration mismatch.
+	needMore := len(modelsToShutdown) < len(conflicts)
+	wd.Unlock()
+
+	for _, m := range modelsToShutdown {
+		if err := wd.pm.ShutdownModel(m); err != nil {
+			xlog.Error("[WatchDog] error shutting down model during group eviction", "error", err, "model", m)
+		}
+		xlog.Debug("[WatchDog] Group eviction complete", "model", m)
+	}
+
+	if needMore {
+		xlog.Warn("[WatchDog] Group eviction incomplete", "requested", requestedModel, "evicted", len(modelsToShutdown), "needed", len(conflicts), "skippedBusy", skippedBusyCount, "reason", "some conflicts are busy or pinned")
+	}
+
+	return EnforceLRULimitResult{
+		EvictedCount: len(modelsToShutdown),
+		NeedMore:     needMore,
+	}
+}
+
+// groupsOverlap reports whether the two group lists share any name.
+func groupsOverlap(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	for _, x := range a {
+		if slices.Contains(b, x) {
+			return true
+		}
+	}
+	return false
 }
 
 func (wd *WatchDog) Run() {
-	log.Info().Msg("[WatchDog] starting watchdog")
+	xlog.Info("[WatchDog] starting watchdog")
 
 	for {
 		select {
 		case <-wd.stop:
-			log.Info().Msg("[WatchDog] Stopping watchdog")
+			xlog.Info("[WatchDog] Stopping watchdog")
+			wd.done <- true
 			return
 		case <-time.After(wd.watchdogInterval):
 			// Check if any monitoring is enabled
@@ -252,7 +505,8 @@ func (wd *WatchDog) Run() {
 			wd.Unlock()
 
 			if !busyCheck && !idleCheck && !memoryCheck {
-				log.Info().Msg("[WatchDog] No checks enabled, stopping watchdog")
+				xlog.Info("[WatchDog] No checks enabled, stopping watchdog")
+				wd.done <- true
 				return
 			}
 			if busyCheck {
@@ -270,19 +524,23 @@ func (wd *WatchDog) Run() {
 
 func (wd *WatchDog) checkIdle() {
 	wd.Lock()
-	log.Debug().Msg("[WatchDog] Watchdog checks for idle connections")
+	xlog.Debug("[WatchDog] Watchdog checks for idle connections")
 
 	// Collect models to shutdown while holding the lock
 	var modelsToShutdown []string
 	for address, t := range wd.idleTime {
-		log.Debug().Msgf("[WatchDog] %s: idle connection", address)
+		xlog.Debug("[WatchDog] idle connection", "address", address)
 		if time.Since(t) > wd.idletimeout {
-			log.Warn().Msgf("[WatchDog] Address %s is idle for too long, killing it", address)
 			model, ok := wd.addressModelMap[address]
 			if ok {
+				if wd.pinnedModels[model] {
+					xlog.Debug("[WatchDog] Skipping idle eviction for pinned model", "model", model)
+					continue
+				}
+				xlog.Warn("[WatchDog] Address is idle for too long, killing it", "address", address)
 				modelsToShutdown = append(modelsToShutdown, model)
 			} else {
-				log.Warn().Msgf("[WatchDog] Address %s unresolvable", address)
+				xlog.Warn("[WatchDog] Address unresolvable", "address", address)
 			}
 			wd.untrack(address)
 		}
@@ -292,28 +550,28 @@ func (wd *WatchDog) checkIdle() {
 	// Now shutdown models without holding the watchdog lock to prevent deadlock
 	for _, model := range modelsToShutdown {
 		if err := wd.pm.ShutdownModel(model); err != nil {
-			log.Error().Err(err).Str("model", model).Msg("[watchdog] error shutting down model")
+			xlog.Error("[watchdog] error shutting down model", "error", err, "model", model)
 		}
-		log.Debug().Msgf("[WatchDog] model shut down: %s", model)
+		xlog.Debug("[WatchDog] model shut down", "model", model)
 	}
 }
 
 func (wd *WatchDog) checkBusy() {
 	wd.Lock()
-	log.Debug().Msg("[WatchDog] Watchdog checks for busy connections")
+	xlog.Debug("[WatchDog] Watchdog checks for busy connections")
 
 	// Collect models to shutdown while holding the lock
 	var modelsToShutdown []string
 	for address, t := range wd.busyTime {
-		log.Debug().Msgf("[WatchDog] %s: active connection", address)
+		xlog.Debug("[WatchDog] active connection", "address", address)
 
 		if time.Since(t) > wd.timeout {
 			model, ok := wd.addressModelMap[address]
 			if ok {
-				log.Warn().Msgf("[WatchDog] Model %s is busy for too long, killing it", model)
+				xlog.Warn("[WatchDog] Model is busy for too long, killing it", "model", model)
 				modelsToShutdown = append(modelsToShutdown, model)
 			} else {
-				log.Warn().Msgf("[WatchDog] Address %s unresolvable", address)
+				xlog.Warn("[WatchDog] Address unresolvable", "address", address)
 			}
 			wd.untrack(address)
 		}
@@ -323,9 +581,9 @@ func (wd *WatchDog) checkBusy() {
 	// Now shutdown models without holding the watchdog lock to prevent deadlock
 	for _, model := range modelsToShutdown {
 		if err := wd.pm.ShutdownModel(model); err != nil {
-			log.Error().Err(err).Str("model", model).Msg("[watchdog] error shutting down model")
+			xlog.Error("[watchdog] error shutting down model", "error", err, "model", model)
 		}
-		log.Debug().Msgf("[WatchDog] model shut down: %s", model)
+		xlog.Debug("[WatchDog] model shut down", "model", model)
 	}
 }
 
@@ -344,7 +602,7 @@ func (wd *WatchDog) checkMemory() {
 	// Get current memory usage (GPU if available, otherwise RAM)
 	aggregate := xsysinfo.GetResourceAggregateInfo()
 	if aggregate.TotalMemory == 0 {
-		log.Debug().Msg("[WatchDog] No memory information available for memory reclaimer")
+		xlog.Debug("[WatchDog] No memory information available for memory reclaimer")
 		return
 	}
 
@@ -356,20 +614,11 @@ func (wd *WatchDog) checkMemory() {
 		memoryType = "RAM"
 	}
 
-	log.Debug().
-		Str("type", memoryType).
-		Float64("usage_percent", aggregate.UsagePercent).
-		Float64("threshold_percent", thresholdPercent).
-		Int("loaded_models", modelCount).
-		Msg("[WatchDog] Memory check")
+	//xlog.Debug("[WatchDog] Memory check", "type", memoryType, "usage_percent", aggregate.UsagePercent, "threshold_percent", thresholdPercent, "loaded_models", modelCount)
 
 	// Check if usage exceeds threshold
 	if aggregate.UsagePercent > thresholdPercent {
-		log.Warn().
-			Str("type", memoryType).
-			Float64("usage_percent", aggregate.UsagePercent).
-			Float64("threshold_percent", thresholdPercent).
-			Msg("[WatchDog] Memory usage exceeds threshold, evicting LRU backend")
+		xlog.Warn("[WatchDog] Memory usage exceeds threshold, evicting LRU backend", "type", memoryType, "usage_percent", aggregate.UsagePercent, "threshold_percent", thresholdPercent)
 
 		// Evict the least recently used model
 		wd.evictLRUModel()
@@ -384,6 +633,8 @@ func (wd *WatchDog) evictLRUModel() {
 		wd.Unlock()
 		return
 	}
+
+	forceEvictionWhenBusy := wd.forceEvictionWhenBusy
 
 	// Build a list of models sorted by last used time (oldest first)
 	var models []modelUsageInfo
@@ -405,26 +656,48 @@ func (wd *WatchDog) evictLRUModel() {
 	}
 
 	// Sort by lastUsed time (oldest first)
-	sort.Slice(models, func(i, j int) bool {
-		return models[i].lastUsed.Before(models[j].lastUsed)
+	slices.SortFunc(models, func(a, b modelUsageInfo) int {
+		return a.lastUsed.Compare(b.lastUsed)
 	})
 
-	// Get the LRU model
-	lruModel := models[0]
-	log.Info().
-		Str("model", lruModel.model).
-		Time("lastUsed", lruModel.lastUsed).
-		Msg("[WatchDog] Memory reclaimer evicting LRU model")
+	// Find the first non-busy, non-pinned model (or first non-pinned model if forceEvictionWhenBusy is true)
+	var lruModel *modelUsageInfo
+	for i := range len(models) {
+		m := models[i]
+		if wd.pinnedModels[m.model] {
+			xlog.Debug("[WatchDog] Skipping memory reclaimer eviction for pinned model", "model", m.model)
+			continue
+		}
+		_, isBusy := wd.busyTime[m.address]
+		if isBusy && !forceEvictionWhenBusy {
+			// Skip busy models when forceEvictionWhenBusy is false
+			xlog.Warn("[WatchDog] Skipping memory reclaimer eviction for busy model", "model", m.model, "reason", "model has active API calls")
+			continue
+		}
+		lruModel = &m
+		break
+	}
 
-	// Untrack the model
-	wd.untrack(lruModel.address)
+	if lruModel == nil {
+		// All models are busy and forceEvictionWhenBusy is false
+		wd.Unlock()
+		xlog.Warn("[WatchDog] Memory reclaimer cannot evict: all models are busy with active API calls")
+		return
+	}
+
+	xlog.Info("[WatchDog] Memory reclaimer evicting LRU model", "model", lruModel.model, "lastUsed", lruModel.lastUsed)
+
 	wd.Unlock()
 
 	// Shutdown the model
-	if err := wd.pm.ShutdownModel(lruModel.model); err != nil {
-		log.Error().Err(err).Str("model", lruModel.model).Msg("[WatchDog] error shutting down model during memory reclamation")
+	if err := wd.pm.ShutdownModel(lruModel.model); err != nil && err != modelNotFoundErr {
+		xlog.Error("[WatchDog] error shutting down model during memory reclamation", "error", err, "model", lruModel.model)
 	} else {
-		log.Info().Str("model", lruModel.model).Msg("[WatchDog] Memory reclaimer eviction complete")
+		// Untrack the model
+		wd.Lock()
+		wd.untrack(lruModel.address)
+		wd.Unlock()
+		xlog.Info("[WatchDog] Memory reclaimer eviction complete", "model", lruModel.model)
 	}
 }
 

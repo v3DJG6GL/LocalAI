@@ -2,6 +2,7 @@ package schema
 
 import (
 	"context"
+	"encoding/json"
 
 	functions "github.com/mudler/LocalAI/pkg/functions"
 )
@@ -18,23 +19,59 @@ type ErrorResponse struct {
 	Error *APIError `json:"error,omitempty"`
 }
 
+type InputTokensDetails struct {
+	TextTokens  int `json:"text_tokens"`
+	ImageTokens int `json:"image_tokens"`
+}
+
 type OpenAIUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Fields for image generation API compatibility
+	InputTokens        int                 `json:"input_tokens,omitempty"`
+	OutputTokens       int                 `json:"output_tokens,omitempty"`
+	InputTokensDetails *InputTokensDetails `json:"input_tokens_details,omitempty"`
 	// Extra timing data, disabled by default as is't not a part of OpenAI specification
 	TimingPromptProcessing float64 `json:"timing_prompt_processing,omitempty"`
 	TimingTokenGeneration  float64 `json:"timing_token_generation,omitempty"`
 }
 
 type Item struct {
-	Embedding []float32 `json:"embedding"`
-	Index     int       `json:"index"`
-	Object    string    `json:"object,omitempty"`
+	Embedding       []float32 `json:"-"`
+	EmbeddingBase64 string    `json:"-"`
+	Index           int       `json:"index"`
+	Object          string    `json:"object,omitempty"`
 
 	// Images
 	URL     string `json:"url,omitempty"`
 	B64JSON string `json:"b64_json,omitempty"`
+}
+
+// MarshalJSON serialises Item so that the "embedding" field is either a float array
+// or a base64 string depending on which field is populated.  This satisfies the
+// OpenAI API encoding_format contract: the Node.js SDK (v4+) sends
+// encoding_format=base64 by default and expects a base64 string back.
+func (item Item) MarshalJSON() ([]byte, error) {
+	type itemFields struct {
+		Embedding any    `json:"embedding,omitempty"`
+		Index     int    `json:"index"`
+		Object    string `json:"object,omitempty"`
+		URL       string `json:"url,omitempty"`
+		B64JSON   string `json:"b64_json,omitempty"`
+	}
+	f := itemFields{
+		Index:   item.Index,
+		Object:  item.Object,
+		URL:     item.URL,
+		B64JSON: item.B64JSON,
+	}
+	if item.EmbeddingBase64 != "" {
+		f.Embedding = item.EmbeddingBase64
+	} else {
+		f.Embedding = item.Embedding
+	}
+	return json.Marshal(f)
 }
 
 type OpenAIResponse struct {
@@ -45,15 +82,29 @@ type OpenAIResponse struct {
 	Choices []Choice `json:"choices,omitempty"`
 	Data    []Item   `json:"data,omitempty"`
 
-	Usage OpenAIUsage `json:"usage"`
+	// Usage is intentionally a pointer with omitempty: per the OpenAI
+	// chat-completion streaming spec, intermediate chunks must not carry
+	// a `usage` field. Marshalling a value-typed usage would emit
+	// `"usage":{"prompt_tokens":0,...}` on every chunk and break
+	// OpenAI-SDK consumers that filter on a truthy `result.usage`
+	// (continuedev/continue, Kilo Code, Roo Code, etc.).
+	Usage *OpenAIUsage `json:"usage,omitempty"`
+}
+
+// StreamOptions mirrors OpenAI's `stream_options` request field. The only
+// member currently honored is IncludeUsage; when true, the streaming
+// chat-completion response emits a trailing chunk with `choices:[]` and a
+// populated `usage` object.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty" yaml:"include_usage,omitempty"`
 }
 
 type Choice struct {
-	Index        int      `json:"index"`
-	FinishReason *string  `json:"finish_reason"`
-	Message      *Message `json:"message,omitempty"`
-	Delta        *Message `json:"delta,omitempty"`
-	Text         string   `json:"text,omitempty"`
+	Index        int       `json:"index"`
+	FinishReason *string   `json:"finish_reason"`
+	Message      *Message  `json:"message,omitempty"`
+	Delta        *Message  `json:"delta,omitempty"`
+	Text         string    `json:"text,omitempty"`
 	Logprobs     *Logprobs `json:"logprobs,omitempty"`
 }
 
@@ -98,6 +149,17 @@ type ImageGenerationResponseFormat string
 
 type ChatCompletionResponseFormatType string
 
+type TranscriptionResponseFormatType string
+
+const (
+	TranscriptionResponseFormatText        = TranscriptionResponseFormatType("txt")
+	TranscriptionResponseFormatSrt         = TranscriptionResponseFormatType("srt")
+	TranscriptionResponseFormatVtt         = TranscriptionResponseFormatType("vtt")
+	TranscriptionResponseFormatLrc         = TranscriptionResponseFormatType("lrc")
+	TranscriptionResponseFormatJson        = TranscriptionResponseFormatType("json")
+	TranscriptionResponseFormatJsonVerbose = TranscriptionResponseFormatType("verbose_json")
+)
+
 type ChatCompletionResponseFormat struct {
 	Type ChatCompletionResponseFormatType `json:"type,omitempty"`
 }
@@ -126,32 +188,34 @@ type OpenAIRequest struct {
 	// Reference images for models that support them (e.g., Flux Kontext)
 	RefImages []string `json:"ref_images,omitempty"`
 	//whisper/image
-	ResponseFormat interface{} `json:"response_format,omitempty"`
+	ResponseFormat any `json:"response_format,omitempty"`
 	// image
 	Size string `json:"size"`
 	// Prompt is read only by completion/image API calls
-	Prompt interface{} `json:"prompt" yaml:"prompt"`
+	Prompt any `json:"prompt" yaml:"prompt"`
 
 	// Edit endpoint
-	Instruction string      `json:"instruction" yaml:"instruction"`
-	Input       interface{} `json:"input" yaml:"input"`
+	Instruction string `json:"instruction" yaml:"instruction"`
+	Input       any    `json:"input" yaml:"input"`
 
-	Stop interface{} `json:"stop" yaml:"stop"`
+	Stop any `json:"stop" yaml:"stop"`
 
 	// Messages is read only by chat/completion API calls
 	Messages []Message `json:"messages" yaml:"messages"`
 
 	// A list of available functions to call
 	Functions    functions.Functions `json:"functions" yaml:"functions"`
-	FunctionCall interface{}         `json:"function_call" yaml:"function_call"` // might be a string or an object
+	FunctionCall any                 `json:"function_call" yaml:"function_call"` // might be a string or an object
 
 	Tools       []functions.Tool `json:"tools,omitempty" yaml:"tools"`
-	ToolsChoice interface{}      `json:"tool_choice,omitempty" yaml:"tool_choice"`
+	ToolsChoice any              `json:"tool_choice,omitempty" yaml:"tool_choice"`
 
 	Stream bool `json:"stream"`
 
+	// StreamOptions opts into OpenAI streaming extensions, e.g. include_usage.
+	StreamOptions *StreamOptions `json:"stream_options,omitempty" yaml:"stream_options,omitempty"`
+
 	// Image (not supported by OpenAI)
-	Mode    int    `json:"mode"`
 	Quality string `json:"quality"`
 	Step    int    `json:"step"`
 

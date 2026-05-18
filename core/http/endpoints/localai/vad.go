@@ -7,11 +7,12 @@ import (
 	"github.com/mudler/LocalAI/core/http/middleware"
 	"github.com/mudler/LocalAI/core/schema"
 	"github.com/mudler/LocalAI/pkg/model"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 // VADEndpoint is Voice-Activation-Detection endpoint
 // @Summary	Detect voice fragments in an audio stream
+// @Tags audio
 // @Accept json
 // @Param		request	body		schema.VADRequest	true	"query params"
 // @Success 200 {object} proto.VADResponse "Response"
@@ -28,7 +29,7 @@ func VADEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig 
 			return echo.ErrBadRequest
 		}
 
-		log.Debug().Str("model", input.Model).Msg("LocalAI VAD Request received")
+		xlog.Debug("LocalAI VAD Request received", "model", input.Model)
 
 		resp, err := backend.VAD(input, c.Request().Context(), ml, appConfig, *cfg)
 

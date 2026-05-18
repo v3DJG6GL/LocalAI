@@ -13,7 +13,7 @@ import (
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/LocalAI/pkg/model"
 	"github.com/mudler/LocalAI/pkg/system"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 type SoundGenerationCMD struct {
@@ -70,7 +70,6 @@ func (t *SoundGenerationCMD) Run(ctx *cliContext.Context) error {
 		backend := v[:strings.IndexByte(v, ':')]
 		uri := v[strings.IndexByte(v, ':')+1:]
 		externalBackends[backend] = uri
-		fmt.Printf("TMP externalBackends[%q]=%q\n\n", backend, uri)
 	}
 
 	opts := &config.ApplicationConfig{
@@ -84,7 +83,7 @@ func (t *SoundGenerationCMD) Run(ctx *cliContext.Context) error {
 	defer func() {
 		err := ml.StopAllGRPC()
 		if err != nil {
-			log.Error().Err(err).Msg("unable to stop all grpc processes")
+			xlog.Error("unable to stop all grpc processes", "error", err)
 		}
 	}()
 
@@ -98,9 +97,11 @@ func (t *SoundGenerationCMD) Run(ctx *cliContext.Context) error {
 		inputFile = &t.InputFile
 	}
 
-	filePath, _, err := backend.SoundGeneration(text,
+	filePath, _, err := backend.SoundGeneration(context.Background(), text,
 		parseToFloat32Ptr(t.Duration), parseToFloat32Ptr(t.Temperature), &t.DoSample,
-		inputFile, parseToInt32Ptr(t.InputFileSampleDivisor), ml, opts, options)
+		inputFile, parseToInt32Ptr(t.InputFileSampleDivisor),
+		nil, "", "", nil, "", "", "", nil,
+		ml, opts, options)
 
 	if err != nil {
 		return err

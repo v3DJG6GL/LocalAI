@@ -8,19 +8,22 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/jaypipes/ghw/pkg/gpu"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 const (
-	defaultCapability = "default"
+	// Public constants - used by tests and external packages
+	Nvidia = "nvidia"
+	AMD    = "amd"
+	Intel  = "intel"
+
+	// Private constants - only used within this package
+	defaultCapability  = "default"
+	disableCapability  = "disable"
 	nvidiaL4T         = "nvidia-l4t"
 	darwinX86         = "darwin-x86"
 	metal             = "metal"
-	nvidia            = "nvidia"
-
-	amd   = "amd"
-	intel = "intel"
+	vulkan            = "vulkan"
 
 	nvidiaCuda13    = "nvidia-cuda-13"
 	nvidiaCuda12    = "nvidia-cuda-12"
@@ -30,6 +33,16 @@ const (
 	capabilityEnv        = "LOCALAI_FORCE_META_BACKEND_CAPABILITY"
 	capabilityRunFileEnv = "LOCALAI_FORCE_META_BACKEND_CAPABILITY_RUN_FILE"
 	defaultRunFile       = "/run/localai/capability"
+
+	// Backend detection tokens (private)
+	backendTokenDarwin = "darwin"
+	backendTokenMLX    = "mlx"
+	backendTokenMetal  = "metal"
+	backendTokenL4T    = "l4t"
+	backendTokenCUDA   = "cuda"
+	backendTokenROCM   = "rocm"
+	backendTokenHIP    = "hip"
+	backendTokenSYCL   = "sycl"
 )
 
 var (
@@ -38,10 +51,16 @@ var (
 )
 
 func init() {
-	_, err := os.Stat(filepath.Join("usr", "local", "cuda-13"))
+	_, err := os.Stat(filepath.Join(string(os.PathSeparator), "usr", "local", "cuda-13"))
 	cuda13DirExists = err == nil
-	_, err = os.Stat(filepath.Join("usr", "local", "cuda-12"))
+	_, err = os.Stat(filepath.Join(string(os.PathSeparator), "usr", "local", "cuda-12"))
 	cuda12DirExists = err == nil
+}
+
+// CapabilityFilterDisabled returns true when capability-based backend filtering
+// is disabled via LOCALAI_FORCE_META_BACKEND_CAPABILITY=disable.
+func (s *SystemState) CapabilityFilterDisabled() bool {
+	return s.getSystemCapabilities() == disableCapability
 }
 
 func (s *SystemState) Capability(capMap map[string]string) string {
@@ -49,19 +68,38 @@ func (s *SystemState) Capability(capMap map[string]string) string {
 
 	// Check if the reported capability is in the map
 	if _, exists := capMap[reportedCapability]; exists {
-		log.Debug().Str("reportedCapability", reportedCapability).Any("capMap", capMap).Msg("Using reported capability")
+		xlog.Debug("Using reported capability", "reportedCapability", reportedCapability, "capMap", capMap)
 		return reportedCapability
 	}
 
-	log.Debug().Str("reportedCapability", reportedCapability).Any("capMap", capMap).Msg("The requested capability was not found, using default capability")
-	// Otherwise, return the default capability (catch-all)
+	// Fall back to the explicit "default" catch-all, then to "cpu". The cpu
+	// fallback matters for meta backends that only enumerate GPU variants +
+	// cpu (e.g. vllm maps nvidia/amd/intel/cpu but not default): on a
+	// no-GPU host the reported capability is "default", so without this
+	// we'd filter the meta out and break auto-install by name.
+	if _, exists := capMap[defaultCapability]; exists {
+		xlog.Debug("Capability not in map, falling back to default", "reportedCapability", reportedCapability, "capMap", capMap)
+		return defaultCapability
+	}
+	if _, exists := capMap["cpu"]; exists {
+		xlog.Debug("Capability not in map, falling back to cpu", "reportedCapability", reportedCapability, "capMap", capMap)
+		return "cpu"
+	}
+
+	xlog.Debug("The requested capability was not found, using default capability", "reportedCapability", reportedCapability, "capMap", capMap)
 	return defaultCapability
 }
 
 func (s *SystemState) getSystemCapabilities() string {
+
+	if s.systemCapabilities != "" {
+		return s.systemCapabilities
+	}
+
 	capability := os.Getenv(capabilityEnv)
 	if capability != "" {
-		log.Info().Str("capability", capability).Msgf("Using forced capability from environment variable (%s)", capabilityEnv)
+		xlog.Info("Using forced capability from environment variable", "capability", capability, "env", capabilityEnv)
+		s.systemCapabilities = capability
 		return capability
 	}
 
@@ -77,79 +115,71 @@ func (s *SystemState) getSystemCapabilities() string {
 	if _, err := os.Stat(capabilityRunFile); err == nil {
 		capability, err := os.ReadFile(capabilityRunFile)
 		if err == nil {
-			log.Info().Str("capabilityRunFile", capabilityRunFile).Str("capability", string(capability)).Msgf("Using forced capability run file (%s)", capabilityRunFileEnv)
-			return strings.Trim(strings.TrimSpace(string(capability)), "\n")
+			xlog.Info("Using forced capability run file", "capabilityRunFile", capabilityRunFile, "capability", string(capability), "env", capabilityRunFileEnv)
+			s.systemCapabilities = strings.Trim(strings.TrimSpace(string(capability)), "\n")
+			return s.systemCapabilities
 		}
 	}
 
 	// If we are on mac and arm64, we will return metal
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		log.Info().Msgf("Using metal capability (arm64 on mac), set %s to override", capabilityEnv)
-		return metal
+		xlog.Info("Using metal capability (arm64 on mac)", "env", capabilityEnv)
+		s.systemCapabilities = metal
+		return s.systemCapabilities
 	}
 
 	// If we are on mac and x86, we will return darwin-x86
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "amd64" {
-		log.Info().Msgf("Using darwin-x86 capability (amd64 on mac), set %s to override", capabilityEnv)
-		return darwinX86
+		xlog.Info("Using darwin-x86 capability (amd64 on mac)", "env", capabilityEnv)
+		s.systemCapabilities = darwinX86
+		return s.systemCapabilities
 	}
 
 	// If arm64 on linux and a nvidia gpu is detected, we will return nvidia-l4t
 	if runtime.GOOS == "linux" && runtime.GOARCH == "arm64" {
-		if s.GPUVendor == nvidia {
-			log.Info().Msgf("Using nvidia-l4t capability (arm64 on linux), set %s to override", capabilityEnv)
+		if s.GPUVendor == Nvidia {
+			xlog.Info("Using nvidia-l4t capability (arm64 on linux)", "env", capabilityEnv)
 			if cuda13DirExists {
-				return nvidiaL4TCuda13
+				s.systemCapabilities = nvidiaL4TCuda13
+				return s.systemCapabilities
 			}
 			if cuda12DirExists {
-				return nvidiaL4TCuda12
+				s.systemCapabilities = nvidiaL4TCuda12
+				return s.systemCapabilities
 			}
-			return nvidiaL4T
+			s.systemCapabilities = nvidiaL4T
+			return s.systemCapabilities
 		}
 	}
 
-	if cuda13DirExists {
-		return nvidiaCuda13
-	}
-
-	if cuda12DirExists {
-		return nvidiaCuda12
-	}
-
+	// No GPU detected → default capability
 	if s.GPUVendor == "" {
-		log.Info().Msgf("Default capability (no GPU detected), set %s to override", capabilityEnv)
-		return defaultCapability
+		xlog.Info("Default capability (no GPU detected)", "env", capabilityEnv)
+		s.systemCapabilities = defaultCapability
+		return s.systemCapabilities
 	}
 
-	log.Info().Str("Capability", s.GPUVendor).Msgf("Capability automatically detected, set %s to override", capabilityEnv)
-	// If vram is less than 4GB, let's default to CPU but warn the user that they can override that via env
+	// GPU detected but insufficient VRAM → default with warning
 	if s.VRAM <= 4*1024*1024*1024 {
-		log.Warn().Msgf("VRAM is less than 4GB, defaulting to CPU. Set %s to override", capabilityEnv)
-		return defaultCapability
+		xlog.Warn("VRAM is less than 4GB, defaulting to CPU", "env", capabilityEnv)
+		s.systemCapabilities = defaultCapability
+		return s.systemCapabilities
 	}
 
-	return s.GPUVendor
-}
-
-func detectGPUVendor(gpus []*gpu.GraphicsCard) (string, error) {
-	for _, gpu := range gpus {
-		if gpu.DeviceInfo != nil {
-			if gpu.DeviceInfo.Vendor != nil {
-				gpuVendorName := strings.ToUpper(gpu.DeviceInfo.Vendor.Name)
-				if strings.Contains(gpuVendorName, strings.ToUpper(nvidia)) {
-					return nvidia, nil
-				}
-				if strings.Contains(gpuVendorName, strings.ToUpper(amd)) {
-					return amd, nil
-				}
-				if strings.Contains(gpuVendorName, strings.ToUpper(intel)) {
-					return intel, nil
-				}
-			}
+	// CUDA directories refine capability only for NVIDIA GPUs
+	if s.GPUVendor == Nvidia {
+		if cuda13DirExists {
+			s.systemCapabilities = nvidiaCuda13
+			return s.systemCapabilities
+		}
+		if cuda12DirExists {
+			s.systemCapabilities = nvidiaCuda12
+			return s.systemCapabilities
 		}
 	}
 
-	return "", nil
+	s.systemCapabilities = s.GPUVendor
+	return s.systemCapabilities
 }
 
 // BackendPreferenceTokens returns a list of substrings that represent the preferred
@@ -159,17 +189,80 @@ func detectGPUVendor(gpus []*gpu.GraphicsCard) (string, error) {
 func (s *SystemState) BackendPreferenceTokens() []string {
 	capStr := strings.ToLower(s.getSystemCapabilities())
 	switch {
-	case strings.HasPrefix(capStr, nvidia):
-		return []string{"cuda", "vulkan", "cpu"}
-	case strings.HasPrefix(capStr, amd):
-		return []string{"rocm", "hip", "vulkan", "cpu"}
-	case strings.HasPrefix(capStr, intel):
-		return []string{"sycl", intel, "cpu"}
+	case strings.HasPrefix(capStr, Nvidia):
+		return []string{backendTokenCUDA, vulkan, "cpu"}
+	case strings.HasPrefix(capStr, AMD):
+		return []string{backendTokenROCM, backendTokenHIP, vulkan, "cpu"}
+	case strings.HasPrefix(capStr, Intel):
+		return []string{backendTokenSYCL, Intel, "cpu"}
 	case strings.HasPrefix(capStr, metal):
-		return []string{"metal", "cpu"}
+		return []string{backendTokenMetal, "cpu"}
 	case strings.HasPrefix(capStr, darwinX86):
 		return []string{"darwin-x86", "cpu"}
+	case strings.HasPrefix(capStr, vulkan):
+		return []string{vulkan, "cpu"}
 	default:
 		return []string{"cpu"}
 	}
+}
+
+// DetectedCapability returns the detected system capability string.
+// This can be used by the UI to display what capability was detected.
+func (s *SystemState) DetectedCapability() string {
+	return s.getSystemCapabilities()
+}
+
+// IsBackendCompatible checks if a backend (identified by name and URI) is compatible
+// with the current system capability. This function uses getSystemCapabilities to ensure
+// consistency with capability detection (including VRAM checks, environment overrides, etc.).
+func (s *SystemState) IsBackendCompatible(name, uri string) bool {
+	if s.CapabilityFilterDisabled() {
+		return true
+	}
+
+	combined := strings.ToLower(name + " " + uri)
+	capability := s.getSystemCapabilities()
+
+	// Check for darwin/macOS-specific backends (mlx, metal, darwin)
+	isDarwinBackend := strings.Contains(combined, backendTokenDarwin) ||
+		strings.Contains(combined, backendTokenMLX) ||
+		strings.Contains(combined, backendTokenMetal)
+	if isDarwinBackend {
+		// Darwin backends require the system to be running on darwin with metal or darwin-x86 capability
+		return capability == metal || capability == darwinX86
+	}
+
+	// Check for NVIDIA L4T-specific backends (arm64 Linux with NVIDIA GPU)
+	// This must be checked before the general NVIDIA check as L4T backends
+	// may also contain "cuda" or "nvidia" in their names
+	isL4TBackend := strings.Contains(combined, backendTokenL4T)
+	if isL4TBackend {
+		return strings.HasPrefix(capability, nvidiaL4T)
+	}
+
+	// Check for NVIDIA/CUDA-specific backends (non-L4T)
+	isNvidiaBackend := strings.Contains(combined, backendTokenCUDA) ||
+		strings.Contains(combined, Nvidia)
+	if isNvidiaBackend {
+		// NVIDIA backends are compatible with nvidia, nvidia-cuda-12, nvidia-cuda-13, and l4t capabilities
+		return strings.HasPrefix(capability, Nvidia)
+	}
+
+	// Check for AMD/ROCm-specific backends
+	isAMDBackend := strings.Contains(combined, backendTokenROCM) ||
+		strings.Contains(combined, backendTokenHIP) ||
+		strings.Contains(combined, AMD)
+	if isAMDBackend {
+		return capability == AMD
+	}
+
+	// Check for Intel/SYCL-specific backends
+	isIntelBackend := strings.Contains(combined, backendTokenSYCL) ||
+		strings.Contains(combined, Intel)
+	if isIntelBackend {
+		return capability == Intel
+	}
+
+	// CPU backends are always compatible
+	return true
 }

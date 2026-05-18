@@ -1,5 +1,5 @@
 
-LLAMA_VERSION?=ef83fb8601229ff650d952985be47e82d644bfaa
+LLAMA_VERSION?=87589042cac2c390cec8d68fb2fad64e0a2a252a
 LLAMA_REPO?=https://github.com/ggerganov/llama.cpp
 
 CMAKE_ARGS?=
@@ -7,7 +7,8 @@ BUILD_TYPE?=
 NATIVE?=false
 ONEAPI_VARS?=/opt/intel/oneapi/setvars.sh
 TARGET?=--target grpc-server
-JOBS?=$(shell nproc)
+JOBS?=$(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+ARCH?=$(shell uname -m)
 
 # Disable Shared libs as we are linking on static gRPC and we can't mix shared and static
 CMAKE_ARGS+=-DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF
@@ -32,7 +33,10 @@ else ifeq ($(BUILD_TYPE),hipblas)
 	ROCM_PATH ?= /opt/rocm
 	export CXX=$(ROCM_HOME)/llvm/bin/clang++
 	export CC=$(ROCM_HOME)/llvm/bin/clang
-	AMDGPU_TARGETS?=gfx803,gfx900,gfx906,gfx908,gfx90a,gfx942,gfx1010,gfx1030,gfx1032,gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+	AMDGPU_TARGETS?=gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1101,gfx1102,gfx1151,gfx1200,gfx1201
+ifeq ($(strip $(AMDGPU_TARGETS)),)
+$(error AMDGPU_TARGETS is empty — set it to a comma-separated list of gfx targets e.g. gfx1100,gfx1101)
+endif
 	CMAKE_ARGS+=-DGGML_HIP=ON -DAMDGPU_TARGETS=$(AMDGPU_TARGETS)
 else ifeq ($(BUILD_TYPE),vulkan)
 	CMAKE_ARGS+=-DGGML_VULKAN=1
@@ -106,21 +110,21 @@ llama-cpp-avx: llama.cpp
 	cp -rf $(CURRENT_MAKEFILE_DIR)/../llama-cpp $(CURRENT_MAKEFILE_DIR)/../llama-cpp-avx-build
 	$(MAKE) -C $(CURRENT_MAKEFILE_DIR)/../llama-cpp-avx-build purge
 	$(info ${GREEN}I llama-cpp build info:avx${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off" $(MAKE) VARIANT="llama-cpp-avx-build" build-llama-cpp-grpc-server
+	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=on -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" $(MAKE) VARIANT="llama-cpp-avx-build" build-llama-cpp-grpc-server
 	cp -rfv $(CURRENT_MAKEFILE_DIR)/../llama-cpp-avx-build/grpc-server llama-cpp-avx
 
 llama-cpp-fallback: llama.cpp
 	cp -rf $(CURRENT_MAKEFILE_DIR)/../llama-cpp $(CURRENT_MAKEFILE_DIR)/../llama-cpp-fallback-build
 	$(MAKE) -C $(CURRENT_MAKEFILE_DIR)/../llama-cpp-fallback-build purge
 	$(info ${GREEN}I llama-cpp build info:fallback${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off" $(MAKE) VARIANT="llama-cpp-fallback-build" build-llama-cpp-grpc-server
+	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" $(MAKE) VARIANT="llama-cpp-fallback-build" build-llama-cpp-grpc-server
 	cp -rfv $(CURRENT_MAKEFILE_DIR)/../llama-cpp-fallback-build/grpc-server llama-cpp-fallback
 
 llama-cpp-grpc: llama.cpp
 	cp -rf $(CURRENT_MAKEFILE_DIR)/../llama-cpp $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build
 	$(MAKE) -C $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build purge
 	$(info ${GREEN}I llama-cpp build info:grpc${RESET})
-	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_RPC=ON -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off" TARGET="--target grpc-server --target rpc-server" $(MAKE) VARIANT="llama-cpp-grpc-build" build-llama-cpp-grpc-server
+	CMAKE_ARGS="$(CMAKE_ARGS) -DGGML_RPC=ON -DGGML_AVX=off -DGGML_AVX2=off -DGGML_AVX512=off -DGGML_FMA=off -DGGML_F16C=off -DGGML_BMI2=off" TARGET="--target grpc-server --target rpc-server" $(MAKE) VARIANT="llama-cpp-grpc-build" build-llama-cpp-grpc-server
 	cp -rfv $(CURRENT_MAKEFILE_DIR)/../llama-cpp-grpc-build/grpc-server llama-cpp-grpc
 
 llama-cpp-rpc-server: llama-cpp-grpc
@@ -131,7 +135,7 @@ llama.cpp:
 	cd llama.cpp && \
 	git init && \
 	git remote add origin $(LLAMA_REPO)  && \
-	git fetch origin && \
+	git fetch --all --tags && \
 	git checkout -b build $(LLAMA_VERSION) && \
 	git submodule update --init --recursive --depth 1 --single-branch
 

@@ -11,11 +11,10 @@ import (
 	"github.com/mudler/LocalAI/core/gallery"
 	"github.com/mudler/LocalAI/core/p2p"
 	"github.com/mudler/LocalAI/core/schema"
-	"github.com/mudler/LocalAI/core/services"
+	"github.com/mudler/LocalAI/core/services/galleryop"
 
 	"github.com/mudler/edgevpn/pkg/node"
-	"github.com/rs/zerolog/log"
-	zlog "github.com/rs/zerolog/log"
+	"github.com/mudler/xlog"
 )
 
 func (a *Application) StopP2P() error {
@@ -85,19 +84,37 @@ func (a *Application) StartP2P() error {
 		n = node
 	}
 
-	// Attach a ServiceDiscoverer to the p2p node
-	log.Info().Msg("Starting P2P server discovery...")
-	if err := p2p.ServiceDiscoverer(ctx, n, a.applicationConfig.P2PToken, p2p.NetworkID(networkID, p2p.WorkerID), func(serviceID string, node schema.NodeData) {
+	// Attach a ServiceDiscoverer to the p2p node for llama.cpp workers
+	xlog.Info("Starting P2P server discovery...")
+	if err := p2p.ServiceDiscoverer(ctx, n, a.applicationConfig.P2PToken, p2p.NetworkID(networkID, p2p.LlamaCPPWorkerID), func(serviceID string, node schema.NodeData) {
 		var tunnelAddresses []string
-		for _, v := range p2p.GetAvailableNodes(p2p.NetworkID(networkID, p2p.WorkerID)) {
+		for _, v := range p2p.GetAvailableNodes(p2p.NetworkID(networkID, p2p.LlamaCPPWorkerID)) {
 			if v.IsOnline() {
 				tunnelAddresses = append(tunnelAddresses, v.TunnelAddress)
 			} else {
-				log.Info().Msgf("Node %s is offline", v.ID)
+				xlog.Info("Node is offline", "node", v.ID)
 			}
 		}
-		if a.applicationConfig.TunnelCallback != nil {
-			a.applicationConfig.TunnelCallback(tunnelAddresses)
+		if a.applicationConfig.LlamaCPPTunnelCallback != nil {
+			a.applicationConfig.LlamaCPPTunnelCallback(tunnelAddresses)
+		}
+	}, true); err != nil {
+		return err
+	}
+
+	// Attach a ServiceDiscoverer for MLX distributed workers
+	xlog.Info("Starting MLX P2P worker discovery...")
+	if err := p2p.ServiceDiscoverer(ctx, n, a.applicationConfig.P2PToken, p2p.NetworkID(networkID, p2p.MLXWorkerID), func(serviceID string, node schema.NodeData) {
+		var tunnelAddresses []string
+		for _, v := range p2p.GetAvailableNodes(p2p.NetworkID(networkID, p2p.MLXWorkerID)) {
+			if v.IsOnline() {
+				tunnelAddresses = append(tunnelAddresses, v.TunnelAddress)
+			} else {
+				xlog.Info("MLX node is offline", "node", v.ID)
+			}
+		}
+		if a.applicationConfig.MLXTunnelCallback != nil {
+			a.applicationConfig.MLXTunnelCallback(tunnelAddresses)
 		}
 	}, true); err != nil {
 		return err
@@ -129,31 +146,23 @@ func (a *Application) RestartP2P() error {
 		return fmt.Errorf("P2P token is not set")
 	}
 
-	// Create new context for P2P
-	ctx, cancel := context.WithCancel(appConfig.Context)
-	a.p2pCtx = ctx
-	a.p2pCancel = cancel
-
-	// Get API address from config
-	address := appConfig.APIAddress
-	if address == "" {
-		address = "127.0.0.1:8080" // default
-	}
-
 	// Start P2P stack in a goroutine
+	// Note: StartP2P creates its own context and assigns a.p2pCtx/a.p2pCancel
 	go func() {
 		if err := a.StartP2P(); err != nil {
-			log.Error().Err(err).Msg("Failed to start P2P stack")
-			cancel() // Cancel context on error
+			xlog.Error("Failed to start P2P stack", "error", err)
+			if a.p2pCancel != nil {
+				a.p2pCancel()
+			}
 		}
 	}()
-	log.Info().Msg("P2P stack restarted with new settings")
+	xlog.Info("P2P stack restarted with new settings")
 
 	return nil
 }
 
 func syncState(ctx context.Context, n *node.Node, app *Application) error {
-	zlog.Debug().Msg("[p2p-sync] Syncing state")
+	xlog.Debug("[p2p-sync] Syncing state")
 
 	whatWeHave := []string{}
 	for _, model := range app.ModelConfigLoader().GetAllModelsConfigs() {
@@ -162,20 +171,20 @@ func syncState(ctx context.Context, n *node.Node, app *Application) error {
 
 	ledger, _ := n.Ledger()
 	currentData := ledger.CurrentData()
-	zlog.Debug().Msgf("[p2p-sync] Current data: %v", currentData)
+	xlog.Debug("[p2p-sync] Current data", "data", currentData)
 	data, exists := ledger.GetKey("shared_state", "models")
 	if !exists {
 		ledger.AnnounceUpdate(ctx, time.Minute, "shared_state", "models", whatWeHave)
-		zlog.Debug().Msgf("No models found in the ledger, announced our models: %v", whatWeHave)
+		xlog.Debug("No models found in the ledger, announced our models", "models", whatWeHave)
 	}
 
 	models := []string{}
 	if err := data.Unmarshal(&models); err != nil {
-		zlog.Warn().Err(err).Msg("error unmarshalling models")
+		xlog.Warn("error unmarshalling models", "error", err)
 		return nil
 	}
 
-	zlog.Debug().Msgf("[p2p-sync] Models that are present in this instance: %v\nModels that are in the ledger: %v", whatWeHave, models)
+	xlog.Debug("[p2p-sync] Models comparison", "ourModels", whatWeHave, "ledgerModels", models)
 
 	// Sync with our state
 	whatIsNotThere := []string{}
@@ -185,7 +194,7 @@ func syncState(ctx context.Context, n *node.Node, app *Application) error {
 		}
 	}
 	if len(whatIsNotThere) > 0 {
-		zlog.Debug().Msgf("[p2p-sync] Announcing our models: %v", append(models, whatIsNotThere...))
+		xlog.Debug("[p2p-sync] Announcing our models", "models", append(models, whatIsNotThere...))
 		ledger.AnnounceUpdate(
 			ctx,
 			1*time.Minute,
@@ -198,20 +207,20 @@ func syncState(ctx context.Context, n *node.Node, app *Application) error {
 	// Check if we have a model that is not in our state, otherwise install it
 	for _, model := range models {
 		if slices.Contains(whatWeHave, model) {
-			zlog.Debug().Msgf("[p2p-sync] Model %s is already present in this instance", model)
+			xlog.Debug("[p2p-sync] Model is already present in this instance", "model", model)
 			continue
 		}
 
 		// we install model
-		zlog.Info().Msgf("[p2p-sync] Installing model which is not present in this instance: %s", model)
+		xlog.Info("[p2p-sync] Installing model which is not present in this instance", "model", model)
 
 		uuid, err := uuid.NewUUID()
 		if err != nil {
-			zlog.Error().Err(err).Msg("error generating UUID")
+			xlog.Error("error generating UUID", "error", err)
 			continue
 		}
 
-		app.GalleryService().ModelGalleryChannel <- services.GalleryOp[gallery.GalleryModel, gallery.ModelConfig]{
+		app.GalleryService().ModelGalleryChannel <- galleryop.ManagementOp[gallery.GalleryModel, gallery.ModelConfig]{
 			ID:                 uuid.String(),
 			GalleryElementName: model,
 			Galleries:          app.ApplicationConfig().Galleries,
@@ -230,7 +239,7 @@ func (a *Application) p2pSync(ctx context.Context, n *node.Node) error {
 				return
 			case <-time.After(1 * time.Minute):
 				if err := syncState(ctx, n, a); err != nil {
-					zlog.Error().Err(err).Msg("error syncing state")
+					xlog.Error("error syncing state", "error", err)
 				}
 			}
 

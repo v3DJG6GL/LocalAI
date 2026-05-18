@@ -16,10 +16,8 @@ The Python backends use a unified build system based on `libbackend.sh` that pro
 - **transformers** - Hugging Face Transformers framework (PyTorch-based)
 - **vllm** - High-performance LLM inference engine
 - **mlx** - Apple Silicon optimized ML framework
-- **exllama2** - ExLlama2 quantized models
 
 ### Audio & Speech
-- **bark** - Text-to-speech synthesis
 - **coqui** - Coqui TTS models
 - **faster-whisper** - Fast Whisper speech recognition
 - **kitten-tts** - Lightweight TTS
@@ -85,7 +83,7 @@ runUnittests
 The build system automatically detects and configures for different hardware:
 
 - **CPU** - Standard CPU-only builds
-- **CUDA** - NVIDIA GPU acceleration (supports CUDA 11/12)
+- **CUDA** - NVIDIA GPU acceleration (supports CUDA 12/13)
 - **Intel** - Intel XPU/GPU optimization
 - **MLX** - Apple Silicon (M1/M2/M3) optimization
 - **HIP** - AMD GPU acceleration
@@ -95,8 +93,8 @@ The build system automatically detects and configures for different hardware:
 Backends can specify hardware-specific dependencies:
 - `requirements.txt` - Base requirements
 - `requirements-cpu.txt` - CPU-specific packages
-- `requirements-cublas11.txt` - CUDA 11 packages
 - `requirements-cublas12.txt` - CUDA 12 packages
+- `requirements-cublas13.txt` - CUDA 13 packages
 - `requirements-intel.txt` - Intel-optimized packages
 - `requirements-mps.txt` - Apple Silicon packages
 

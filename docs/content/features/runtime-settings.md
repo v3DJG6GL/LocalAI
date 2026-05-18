@@ -1,6 +1,6 @@
 +++
 disableToc = false
-title = "⚙️ Runtime Settings"
+title = "Runtime Settings"
 weight = 25
 url = '/features/runtime-settings'
 +++
@@ -28,9 +28,22 @@ Changes to watchdog settings are applied immediately by restarting the watchdog 
 ### Backend Configuration
 
 - **Max Active Backends**: Maximum number of active backends (loaded models). When exceeded, the least recently used model is automatically evicted. Set to `0` for unlimited, `1` for single-backend mode
-- **Parallel Backend Requests**: Enable backends to handle multiple requests in parallel if supported
+- **Force Eviction When Busy**: Allow evicting models even when they have active API calls (default: disabled for safety). **Warning:** Enabling this can interrupt active requests
+- **LRU Eviction Max Retries**: Maximum number of retries when waiting for busy models to become idle before eviction (default: 30)
+- **LRU Eviction Retry Interval**: Interval between retries when waiting for busy models (default: `1s`)
 
 > **Note:** The "Single Backend" setting is deprecated. Use "Max Active Backends" set to `1` for single-backend behavior.
+
+#### LRU Eviction Behavior
+
+By default, LocalAI will skip evicting models that have active API calls to prevent interrupting ongoing requests. When all models are busy and eviction is needed:
+
+1. The system will wait for models to become idle
+2. It will retry eviction up to the configured maximum number of retries
+3. The retry interval determines how long to wait between attempts
+4. If all retries are exhausted, the system will proceed (which may cause out-of-memory errors if resources are truly exhausted)
+
+You can configure these settings via the web UI or through environment variables. See [VRAM Management]({{%relref "advanced/vram-management" %}}) for more details.
 
 ### Performance Settings
 
@@ -48,6 +61,8 @@ Changes to watchdog settings are applied immediately by restarting the watchdog 
 - **CORS Allow Origins**: Comma-separated list of allowed CORS origins
 - **CSRF**: Enable CSRF protection middleware
 - **API Keys**: Manage API keys for authentication (one per line or comma-separated)
+
+For multi-user authentication with roles, OAuth, and usage tracking, see [Authentication & Authorization]({{%relref "features/authentication" %}}).
 
 ### P2P Settings
 
@@ -67,6 +82,20 @@ Manage model and backend galleries:
 - **Backend Galleries**: JSON array of backend gallery objects
 - **Autoload Galleries**: Automatically load model galleries on startup
 - **Autoload Backend Galleries**: Automatically load backend galleries on startup
+
+### Agent Pool Settings
+
+Configure the built-in agent platform (see [Agents]({{%relref "features/agents" %}}) for full documentation):
+
+- **Agent Pool Enabled**: Enable or disable the agent pool feature
+- **Default Model**: Default LLM model for new agents
+- **Embedding Model**: Model used for knowledge base embeddings (default: `granite-embedding-107m-multilingual`)
+- **Max Chunking Size**: Maximum chunk size for document ingestion (default: `400`)
+- **Chunk Overlap**: Overlap between document chunks (default: `0`)
+- **Enable Logs**: Enable detailed agent logging
+- **Collection DB Path**: Custom path for the collections database
+
+> **Note:** Most agent pool settings require a restart to take effect.
 
 ## Configuration Persistence
 
@@ -93,7 +122,9 @@ The `runtime_settings.json` file follows this structure:
   "watchdog_idle_timeout": "15m",
   "watchdog_busy_timeout": "5m",
   "max_active_backends": 0,
-  "parallel_backend_requests": true,
+  "force_eviction_when_busy": false,
+  "lru_eviction_max_retries": 30,
+  "lru_eviction_retry_interval": "1s",
   "threads": 8,
   "context_size": 2048,
   "f16": false,

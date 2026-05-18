@@ -1,15 +1,23 @@
-ARG BASE_IMAGE=ubuntu:22.04
-ARG GRPC_BASE_IMAGE=${BASE_IMAGE}
+ARG BASE_IMAGE=ubuntu:24.04
 ARG INTEL_BASE_IMAGE=${BASE_IMAGE}
+ARG UBUNTU_CODENAME=noble
+# Optional alternate Ubuntu apt mirror(s). Empty = use upstream.
+# See .docker/apt-mirror.sh for accepted values.
+ARG APT_MIRROR=""
+ARG APT_PORTS_MIRROR=""
 
 FROM ${BASE_IMAGE} AS requirements
 
+ARG APT_MIRROR
+ARG APT_PORTS_MIRROR
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && \
+RUN --mount=type=bind,source=.docker/apt-mirror.sh,target=/usr/local/sbin/apt-mirror \
+    APT_MIRROR="${APT_MIRROR}" APT_PORTS_MIRROR="${APT_PORTS_MIRROR}" sh /usr/local/sbin/apt-mirror && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl wget espeak-ng libgomp1 \
-        ffmpeg && \
+        ffmpeg libopenblas0 libopenblas-dev libopus0 sox && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -23,7 +31,7 @@ ARG SKIP_DRIVERS=false
 ARG TARGETARCH
 ARG TARGETVARIANT
 ENV BUILD_TYPE=${BUILD_TYPE}
-ARG UBUNTU_VERSION=2204
+ARG UBUNTU_VERSION=2404
 
 RUN mkdir -p /run/localai
 RUN echo "default" > /run/localai/capability
@@ -34,11 +42,45 @@ RUN <<EOT bash
         apt-get update && \
         apt-get install -y  --no-install-recommends \
             software-properties-common pciutils wget gpg-agent && \
-        wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | apt-key add - && \
-        wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list && \
-        apt-get update && \
-        apt-get install -y \
-            vulkan-sdk && \
+        apt-get install -y libglm-dev cmake libxcb-dri3-0 libxcb-present0 libpciaccess0 \
+            libpng-dev libxcb-keysyms1-dev libxcb-dri3-dev libx11-dev g++ gcc \
+            libwayland-dev libxrandr-dev libxcb-randr0-dev libxcb-ewmh-dev \
+            git python-is-python3 bison libx11-xcb-dev liblz4-dev libzstd-dev \
+            ocaml-core ninja-build pkg-config libxml2-dev wayland-protocols python3-jsonschema \
+            clang-format qtbase5-dev qt6-base-dev libxcb-glx0-dev sudo xz-utils mesa-vulkan-drivers
+        if [ "amd64" = "$TARGETARCH" ]; then
+            wget "https://sdk.lunarg.com/sdk/download/1.4.335.0/linux/vulkansdk-linux-x86_64-1.4.335.0.tar.xz" && \
+            tar -xf vulkansdk-linux-x86_64-1.4.335.0.tar.xz && \
+            rm vulkansdk-linux-x86_64-1.4.335.0.tar.xz && \
+            mkdir -p /opt/vulkan-sdk && \
+            mv 1.4.335.0 /opt/vulkan-sdk/ && \
+            cd /opt/vulkan-sdk/1.4.335.0 && \
+            ./vulkansdk --no-deps --maxjobs \
+                vulkan-loader \
+                vulkan-validationlayers \
+                vulkan-extensionlayer \
+                vulkan-tools \
+                shaderc && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/bin/* /usr/bin/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/lib/* /usr/lib/x86_64-linux-gnu/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/include/* /usr/include/ && \
+            cp -rfv /opt/vulkan-sdk/1.4.335.0/x86_64/share/* /usr/share/ && \
+            rm -rf /opt/vulkan-sdk
+        fi
+        if [ "arm64" = "$TARGETARCH" ]; then
+            mkdir vulkan && cd vulkan && \
+            curl -L -o vulkan-sdk.tar.xz https://github.com/mudler/vulkan-sdk-arm/releases/download/1.4.335.0/vulkansdk-ubuntu-24.04-arm-1.4.335.0.tar.xz && \
+            tar -xvf vulkan-sdk.tar.xz && \
+            rm vulkan-sdk.tar.xz && \
+            cd 1.4.335.0 && \
+            cp -rfv aarch64/bin/* /usr/bin/ && \
+            cp -rfv aarch64/lib/* /usr/lib/aarch64-linux-gnu/ && \
+            cp -rfv aarch64/include/* /usr/include/ && \
+            cp -rfv aarch64/share/* /usr/share/ && \
+            cd ../.. && \
+            rm -rf vulkan
+        fi
+        ldconfig && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/* && \
         echo "vulkan" > /run/localai/capability
@@ -114,6 +156,7 @@ RUN if [ "${BUILD_TYPE}" = "hipblas" ] && [ "${SKIP_DRIVERS}" = "false" ]; then 
         apt-get update && \
         apt-get install -y --no-install-recommends \
             hipblas-dev \
+            hipblaslt-dev \
             rocblas-dev && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/* && \
@@ -141,12 +184,11 @@ ENV PATH=/opt/rocm/bin:${PATH}
 # The requirements-core target is common to all images.  It should not be placed in requirements-core unless every single build will use it.
 FROM requirements-drivers AS build-requirements
 
-ARG GO_VERSION=1.22.6
-ARG CMAKE_VERSION=3.26.4
+ARG GO_VERSION=1.26.0
+ARG CMAKE_VERSION=3.31.10
 ARG CMAKE_FROM_SOURCE=false
 ARG TARGETARCH
 ARG TARGETVARIANT
-
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -156,6 +198,7 @@ RUN apt-get update && \
         curl libssl-dev \
         git \
         git-lfs \
+        libopus-dev pkg-config \
         unzip upx-ucl python3 python-is-python3 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -204,10 +247,15 @@ WORKDIR /build
 # https://community.intel.com/t5/Intel-oneAPI-Math-Kernel-Library/APT-Repository-not-working-signatures-invalid/m-p/1599436/highlight/true#M36143
 # This is a temporary workaround until Intel fixes their repository
 FROM ${INTEL_BASE_IMAGE} AS intel
+ARG UBUNTU_CODENAME=noble
+ARG APT_MIRROR
+ARG APT_PORTS_MIRROR
 RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
 gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
-RUN echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2350 unified" > /etc/apt/sources.list.d/intel-graphics.list
-RUN apt-get update && \
+RUN echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${UBUNTU_CODENAME}/lts/2350 unified" > /etc/apt/sources.list.d/intel-graphics.list
+RUN --mount=type=bind,source=.docker/apt-mirror.sh,target=/usr/local/sbin/apt-mirror \
+    APT_MIRROR="${APT_MIRROR}" APT_PORTS_MIRROR="${APT_PORTS_MIRROR}" sh /usr/local/sbin/apt-mirror && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         intel-oneapi-runtime-libs && \
     apt-get clean && \
@@ -220,7 +268,7 @@ RUN apt-get update && \
 
 FROM build-requirements AS builder-base
 
-ARG GO_TAGS=""
+ARG GO_TAGS="auth"
 ARG GRPC_BACKENDS
 ARG MAKEFLAGS
 ARG LD_FLAGS="-s -w"
@@ -256,6 +304,17 @@ EOT
 ###################################
 ###################################
 
+# Build React UI
+FROM node:26-slim AS react-ui-builder
+WORKDIR /app
+COPY core/http/react-ui/package*.json ./
+RUN npm install
+COPY core/http/react-ui/ ./
+RUN npm run build
+
+###################################
+###################################
+
 # Compile backends first in a separate stage
 FROM builder-base AS builder-backends
 ARG TARGETARCH
@@ -272,7 +331,6 @@ COPY ./.git ./.git
 # Some of the Go backends use libs from the main src, we could further optimize the caching by building the CPP backends before here
 COPY ./pkg/grpc ./pkg/grpc
 COPY ./pkg/utils ./pkg/utils
-COPY ./pkg/langchain ./pkg/langchain
 
 RUN ls -l ./
 RUN make protogen-go
@@ -284,6 +342,9 @@ FROM builder-backends AS builder
 WORKDIR /build
 
 COPY . .
+
+# Copy pre-built React UI
+COPY --from=react-ui-builder /app/dist ./core/http/react-ui/dist
 
 ## Build the binary
 ## If we're on arm64 AND using cublas/hipblas, skip some of the llama-compat backends to save space
@@ -329,14 +390,17 @@ COPY ./entrypoint.sh .
 
 # Copy the binary
 COPY --from=builder /build/local-ai ./
+# Copy the opus shim if it was built
+RUN --mount=from=builder,src=/build/,dst=/mnt/build \
+    if [ -f /mnt/build/libopusshim.so ]; then cp /mnt/build/libopusshim.so ./; fi
 
 # Make sure the models directory exists
-RUN mkdir -p /models /backends
+RUN mkdir -p /models /backends /data
 
 # Define the health check command
 HEALTHCHECK --interval=1m --timeout=10m --retries=10 \
   CMD curl -f ${HEALTHCHECK_ENDPOINT} || exit 1
 
-VOLUME /models /backends /configuration
+VOLUME /models /backends /configuration /data
 EXPOSE 8080
 ENTRYPOINT [ "/entrypoint.sh" ]
